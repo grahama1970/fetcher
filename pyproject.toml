@@ -13,6 +13,7 @@ requires-python = ">=3.12"
 dependencies = [
   "aiohttp>=3.10",
   "beautifulsoup4>=4.12",
+  "charset-normalizer>=3.3",
   "python-dotenv>=1.0",
   "requests>=2.32",
   "lxml>=5.3",
@@ -20,6 +21,8 @@ dependencies = [
   "pymupdf>=1.24",
   "pytesseract>=0.3",
   "pillow>=10.4",
+  "ftfy>=6.2",
+  "readability-lxml>=0.8.1",
 ]
 
 [project.urls]
@@ -30,7 +33,7 @@ Source = "https://github.com/grahama1970/fetcher"
 [project.optional-dependencies]
 alternates = [
   "brave-search>=0.1.8",
-  "scillm>=1.77.2",
+  "scillm @ file:///home/graham/workspace/experiments/litellm",
 ]
 dev = [
   "pytest>=8.3",
@@ -48,6 +51,9 @@ packages = ["src/fetcher"]
 
 [dependency-groups]
 telemetry = ["jsonlines>=4.0"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.mypy]
 python_version = "3.12"

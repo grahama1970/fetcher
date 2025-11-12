@@ -43,6 +43,18 @@ fetcher/
 
 Large crawls can keep JSONL outputs manageable by exporting `FETCHER_TEXT_INLINE_MAX_BYTES` (e.g., `FETCHER_TEXT_INLINE_MAX_BYTES=200000`). When set, oversized response bodies are written to `run/artifacts/text_blobs/` and the JSON metadata stores a pointer via `text_path`.
 
+## Download modes & rolling windows
+
+Use `FETCHER_DOWNLOAD_MODE` to control how response bodies are stored:
+
+- `text` (default): inline text in JSON unless `FETCHER_TEXT_INLINE_MAX_BYTES` externalizes it.
+- `download_only`: persist every body (binary or text) to `run/artifacts/downloads/<sha>.<ext>` and zero the inline `text` field.
+- `rolling_extract`: keep the download + emit JSONL rolling windows under `run/artifacts/rolling_windows/` using `FETCHER_ROLLING_WINDOW_SIZE`, `FETCHER_ROLLING_WINDOW_STEP`, and optional `FETCHER_ROLLING_WINDOW_MAX_WINDOWS`. Windows follow spaCy sentence boundaries when spaCy is installed (otherwise fall back to a regex splitter) so no chunk cuts off a sentence mid-way.
+
+Each HTML result also records a `paywall_detection` blob (score, verdict, indicators) derived from the Sparta detector so downstream agents can decide when to request alternates.
+
+These files are referenced via `blob_path`/`rolling_windows_path` in `FetchResult.metadata`, giving downstream tools (extractor, MCPs, etc.) a deterministic attachment to hand to format-specific providers.
+
 ## Relationship to LiteLLM / SciLLM
 
 The code lives here to make experimentation easier, but nothing prevents you from installing both `scillm` and `fetcher` in the same virtual environment. When the optional `alternates` extra is installed the package will automatically enable SciLLM + Brave resolution just like the router.

@@ -127,6 +127,7 @@ class FetchResult:
     metadata: Dict[str, Any] = field(default_factory=dict)
     from_cache: bool = False
     error: Optional[str] = None
+    raw_bytes: Optional[bytes] = field(default=None, repr=False, compare=False)
 
     def to_dict(self) -> Dict[str, Any]:
         payload = {
@@ -426,12 +427,13 @@ class URLFetcher:
                     method=cached.get("method", "cache"),
                     metadata=metadata,
                     from_cache=True,
+                    raw_bytes=None,
                 )
 
             if domain == "d3fend.mitre.org":
                 local_result = self._fetch_d3fend_local(parsed, base_metadata)
                 if local_result is not None:
-                    status, content_type, text, method, extra_metadata = local_result
+                    status, content_type, text, method, extra_metadata, local_bytes = local_result
                     fetched_at = datetime.now(timezone.utc).isoformat()
                     metadata = {**base_metadata, **(extra_metadata or {})}
                     if status == 200 and text:
@@ -455,11 +457,12 @@ class URLFetcher:
                         method=method,
                         metadata=metadata,
                         from_cache=False,
+                        raw_bytes=local_bytes,
                     )
 
             try:
                 if parsed.scheme == "file":
-                    status, content_type, text, method, extra_metadata = self._fetch_from_file(parsed)
+                    status, content_type, text, method, extra_metadata, local_bytes = self._fetch_from_file(parsed)
                     fetched_at = datetime.now(timezone.utc).isoformat()
                     metadata = {**base_metadata, **(extra_metadata or {})}
                     return FetchResult(
@@ -472,8 +475,9 @@ class URLFetcher:
                         method=method,
                         metadata=metadata,
                         from_cache=False,
+                        raw_bytes=local_bytes,
                     )
-                status, content_type, text, method, extra_metadata = await self._fetch_with_retries(
+                status, content_type, text, method, extra_metadata, raw_bytes = await self._fetch_with_retries(
                     session, url_norm, domain
                 )
                 fetched_at = datetime.now(timezone.utc).isoformat()
@@ -483,12 +487,13 @@ class URLFetcher:
                     alt = _toggle_trailing_slash(url_norm)
                     if alt and alt != url_norm:
                         try:
-                            status2, content_type2, text2, method2, extra_meta2 = await self._fetch_with_retries(
+                            status2, content_type2, text2, method2, extra_meta2, raw_bytes2 = await self._fetch_with_retries(
                                 session, alt, domain
                             )
                             tried_variant = True
                             if status2 == 200 and text2:
                                 status, content_type, text, method = status2, content_type2, text2, method2
+                                raw_bytes = raw_bytes2
                                 extra_metadata = {**extra_metadata, **extra_meta2, "trailing_slash_fallback": True, "url_variant_used": alt}
                         except Exception:
                             pass
@@ -512,6 +517,7 @@ class URLFetcher:
                 method = "error"
                 error = str(exc)
                 metadata = base_metadata
+                raw_bytes = None
 
             return FetchResult(
                 url=url,
@@ -524,6 +530,7 @@ class URLFetcher:
                 metadata=metadata,
                 from_cache=False,
                 error=error,
+                raw_bytes=raw_bytes,
             )
 
     async def _fetch_with_retries(
@@ -531,7 +538,7 @@ class URLFetcher:
         session: aiohttp.ClientSession,
         url: str,
         domain: str,
-    ) -> Tuple[int, str, str, str, Dict[str, Any]]:
+    ) -> Tuple[int, str, str, str, Dict[str, Any], Optional[bytes]]:
         delay = self.config.backoff_initial
         last_exc: Optional[Exception] = None
         for attempt in range(1, self.config.max_attempts + 1):
@@ -552,7 +559,7 @@ class URLFetcher:
         session: aiohttp.ClientSession,
         url: str,
         domain: str,
-    ) -> Tuple[int, str, str, str, Dict[str, Any]]:
+    ) -> Tuple[int, str, str, str, Dict[str, Any], Optional[bytes]]:
         try:
             ssl_context = None
             if domain in self._insecure_ssl_domains:
@@ -570,6 +577,7 @@ class URLFetcher:
         if self._insecure_ssl_domains and domain in self._insecure_ssl_domains:
             extra_metadata["ssl_verification"] = False
         text = ""
+        body_bytes: Optional[bytes] = raw_bytes
 
         is_pdf = "pdf" in content_type.lower() or url.lower().endswith(".pdf")
 
@@ -577,7 +585,7 @@ class URLFetcher:
             method = "pdf"
             text, pdf_meta = self._extract_pdf_text(raw_bytes, url)
             extra_metadata.update(pdf_meta)
-            return 200, "application/pdf", text, method, extra_metadata
+            return 200, "application/pdf", text, method, extra_metadata, raw_bytes
 
         if "zstd" in encoding:
             import zstandard as zstd  # type: ignore
@@ -589,15 +597,17 @@ class URLFetcher:
 
         if raw_bytes:
             text = raw_bytes.decode("utf-8", "ignore")
+            body_bytes = raw_bytes
 
         fallback_statuses = {401, 403, 404, 429}
         fallback_allowed = domain in SPA_FALLBACK_DOMAINS and async_playwright is not None
 
         if status == 200 and not is_pdf:
             if self._needs_playwright(text, content_type) and fallback_allowed:
-                status, content_type, text, pw_meta = await self._fetch_with_playwright(url, status)
+                status, content_type, text, pw_meta, pw_bytes = await self._fetch_with_playwright(url, status)
                 method = "playwright"
                 extra_metadata.update(pw_meta)
+                body_bytes = pw_bytes
             # After we have final HTML text, analyze for link-hub/ToC pages
             try:
                 hub_meta = self._analyze_link_hub(text or "", url)
@@ -606,13 +616,14 @@ class URLFetcher:
             except Exception:
                 pass
         elif fallback_allowed and status in fallback_statuses:
-            status_playwright, content_type_playwright, text_playwright, pw_meta = await self._fetch_with_playwright(url, status)
+            status_playwright, content_type_playwright, text_playwright, pw_meta, pw_bytes = await self._fetch_with_playwright(url, status)
             if text_playwright:
                 status = status_playwright or status
                 content_type = content_type_playwright
                 text = text_playwright
                 method = "playwright"
                 extra_metadata.update(pw_meta)
+                body_bytes = pw_bytes
                 # Analyze link-hub characteristics for the Playwright-rendered HTML
                 try:
                     hub_meta = self._analyze_link_hub(text or "", url)
@@ -634,21 +645,23 @@ class URLFetcher:
         if need_wayback:
             wayback = await self._fetch_from_wayback(session, url)
             if wayback is not None:
-                status, content_type, text, method, wb_meta = wayback
+                status, content_type, text, method, wb_meta, wb_bytes = wayback
                 extra_metadata.update(wb_meta)
+                body_bytes = wb_bytes
             else:
                 jina = await self._fetch_from_jina(session, url)
                 if jina is not None:
-                    status, content_type, text, method, wb_meta = jina
+                    status, content_type, text, method, wb_meta, wb_bytes = jina
                     extra_metadata.update(wb_meta)
+                    body_bytes = wb_bytes
 
-        return status, content_type, text, method, extra_metadata
+        return status, content_type, text, method, extra_metadata, body_bytes
 
     async def _fetch_from_wayback(
         self,
         session: aiohttp.ClientSession,
         url: str,
-    ) -> Optional[Tuple[int, str, str, str, Dict[str, Any]]]:
+    ) -> Optional[Tuple[int, str, str, str, Dict[str, Any], Optional[bytes]]]:
         """Attempt to retrieve the resource from the Internet Archive.
 
         Returns ``None`` when no archival snapshot is available.
@@ -691,13 +704,13 @@ class URLFetcher:
             "via": "wayback",
             "wayback_timestamp": timestamp,
         }
-        return 200, content_type, text, "wayback", metadata
+        return 200, content_type, text, "wayback", metadata, body
 
     async def _fetch_from_jina(
         self,
         session: aiohttp.ClientSession,
         url: str,
-    ) -> Optional[Tuple[int, str, str, str, Dict[str, Any]]]:
+    ) -> Optional[Tuple[int, str, str, str, Dict[str, Any], Optional[bytes]]]:
         """Fallback using r.jina.ai proxy when Cloudflare blocks direct access."""
 
         if not url.startswith("http"):
@@ -718,7 +731,7 @@ class URLFetcher:
             "via": "jina",
             "jina_url": jina_url,
         }
-        return 200, "text/html", text, "jina", metadata
+        return 200, "text/html", text, "jina", metadata, body
 
     def _analyze_link_hub(self, html: str, base_url: str) -> Dict[str, Any]:
         """Detect link-heavy ToC/portal pages and harvest outlinks (bounded).
@@ -831,7 +844,7 @@ class URLFetcher:
         self,
         parsed_url: Any,
         base_metadata: Dict[str, Any],
-    ) -> Optional[Tuple[int, str, str, str, Dict[str, Any]]]:
+    ) -> Optional[Tuple[int, str, str, str, Dict[str, Any], bytes]]:
         if self._local_data_root is None:
             return None
 
@@ -883,7 +896,7 @@ class URLFetcher:
             "d3fend_id": identifier,
             "source": "d3fend_local",
         }
-        return 200, "text/plain", text, "d3fend_local", metadata
+        return 200, "text/plain", text, "d3fend_local", metadata, text.encode("utf-8")
 
     def _lookup_d3fend_record(self, dataset: str, identifier: str) -> Optional[Dict[str, str]]:
         if dataset not in self._d3fend_cache:
@@ -937,7 +950,7 @@ class URLFetcher:
         lowered = text.lower()
         return any(indicator in lowered for indicator in js_indicators)
 
-    async def _fetch_with_playwright(self, url: str, origin_status: Optional[int] = None) -> Tuple[int, str, str, Dict[str, Any]]:
+    async def _fetch_with_playwright(self, url: str, origin_status: Optional[int] = None) -> Tuple[int, str, str, Dict[str, Any], bytes]:
         assert async_playwright is not None  # For type checker
         async with async_playwright() as p:  # type: ignore
             browser = await p.chromium.launch(headless=True)
@@ -959,9 +972,10 @@ class URLFetcher:
         metadata: Dict[str, Any] = {"playwright": True}
         if origin_status is not None:
             metadata["fallback_from_status"] = origin_status
-        return status, content_type.split(";")[0], content, metadata
+        content_type_final = content_type.split(";")[0]
+        return status, content_type_final, content, metadata, content.encode("utf-8", "ignore")
 
-    def _fetch_from_file(self, parsed_url: Any) -> Tuple[int, str, str, str, Dict[str, Any]]:
+    def _fetch_from_file(self, parsed_url: Any) -> Tuple[int, str, str, str, Dict[str, Any], bytes]:
         def _is_within(child: Path, root: Path) -> bool:
             try:
                 child.resolve().relative_to(root.resolve())
@@ -983,13 +997,13 @@ class URLFetcher:
         if suffix == ".pdf":
             text, pdf_meta = self._extract_pdf_text(raw_bytes, str(local_path))
             metadata = {"local_path": str(local_path), **pdf_meta, "playwright": False}
-            return 200, "application/pdf", text, "file", metadata
+            return 200, "application/pdf", text, "file", metadata, raw_bytes
         if suffix in {".html", ".htm"}:
             text = raw_bytes.decode("utf-8", "ignore")
-            return 200, "text/html", text, "file", {"local_path": str(local_path)}
+            return 200, "text/html", text, "file", {"local_path": str(local_path)}, raw_bytes
         # default to plain text
         text = raw_bytes.decode("utf-8", "ignore")
-        return 200, "text/plain", text, "file", {"local_path": str(local_path)}
+        return 200, "text/plain", text, "file", {"local_path": str(local_path)}, raw_bytes
 
     def _extract_pdf_text(self, raw_bytes: bytes, url: str) -> Tuple[str, Dict[str, Any]]:
         try:

@@ -56,7 +56,21 @@ uv add "fetcher[alternates]"
 uv run python -m fetcher.workflows.fetcher --use-alternates inventory.jsonl
 ```
 
-## 6. Tests + lint
+## 6. Download modes (optional)
+Decide how you want bodies stored before running large jobs:
+
+```bash
+export FETCHER_DOWNLOAD_MODE=rolling_extract
+export FETCHER_ROLLING_WINDOW_SIZE=6000
+export FETCHER_ROLLING_WINDOW_STEP=3000
+export FETCHER_SINGLE_RUN_ARTIFACTS=run/fetcher_artifacts
+```
+
+`download_only` writes every body to `run/artifacts/downloads/sha.ext`, while `rolling_extract` also materializes overlapping text windows under `run/artifacts/rolling_windows/` for streaming ingestion. Use `text` to keep legacy inline behavior.
+
+Sentence segmentation prefers spaCy's sentencizer when installed and falls back to a regex-based splitter otherwise.
+
+## 7. Tests + lint
 ```bash
 uv run pytest
 uv run ruff check src

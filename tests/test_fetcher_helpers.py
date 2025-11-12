@@ -1,6 +1,12 @@
+import json
 from pathlib import Path
 
-from fetcher.workflows import fetcher
+from fetcher.workflows import fetcher, paywall_detector
+from fetcher.workflows.fetcher_utils import resolve_repo_root
+from fetcher.workflows.download_utils import (
+    apply_download_mode,
+    maybe_externalize_text,
+)
 from fetcher.workflows.web_fetch import FetchResult, _select_wayback_timestamp
 
 
@@ -12,7 +18,7 @@ def test_resolve_repo_root_finds_data_dir(tmp_path: Path) -> None:
     inventory.parent.mkdir(parents=True)
     inventory.write_text("{}\n", encoding="utf-8")
 
-    resolved = fetcher._resolve_repo_root(inventory)
+    resolved = resolve_repo_root(inventory)
 
     assert resolved == repo_root
 
@@ -21,7 +27,7 @@ def test_resolve_repo_root_falls_back(tmp_path: Path) -> None:
     inventory = tmp_path / "inventory.jsonl"
     inventory.write_text("{}\n", encoding="utf-8")
 
-    resolved = fetcher._resolve_repo_root(inventory)
+    resolved = resolve_repo_root(inventory)
 
     assert resolved == inventory.parent
 
@@ -37,7 +43,7 @@ def test_maybe_externalize_text(tmp_path: Path) -> None:
         method="aiohttp",
     )
 
-    fetcher._maybe_externalize_text([result], tmp_path, max_inline_bytes=8)
+    maybe_externalize_text([result], tmp_path, max_inline_bytes=8)
 
     assert result.text == ""
     metadata = result.metadata or {}
@@ -58,3 +64,78 @@ def test_select_wayback_timestamp_prefers_first_column() -> None:
 
 def test_select_wayback_timestamp_handles_missing_rows() -> None:
     assert _select_wayback_timestamp([["timestamp"]]) is None
+
+
+def test_apply_download_mode_download_only(tmp_path: Path) -> None:
+    result = FetchResult(
+        url="https://example.com/alpha.pdf",
+        domain="example.com",
+        status=200,
+        content_type="application/pdf",
+        text="PDF CONTENT",
+        fetched_at="2024-01-01T00:00:00Z",
+        method="aiohttp",
+        raw_bytes=b"PDF CONTENT",
+    )
+
+    artifacts = tmp_path / "artifacts"
+    apply_download_mode([result], artifacts, "download_only", 1000, 500, 0)
+
+    metadata = result.metadata or {}
+    blob_path = Path(metadata["blob_path"])
+    assert blob_path.exists()
+    assert metadata["download_mode"] == "download_only"
+    assert result.text == ""
+    assert result.raw_bytes is None
+
+
+def test_apply_download_mode_rolling_extract(tmp_path: Path) -> None:
+    sentences = [
+        "This is sentence one.",
+        "Here is sentence two with more words.",
+        "Sentence three ensures overlap across windows.",
+        "Finally, sentence four closes the test case.",
+    ]
+    text = " ".join(sentences)
+    result = FetchResult(
+        url="https://example.com/doc.html",
+        domain="example.com",
+        status=200,
+        content_type="text/html",
+        text=text,
+        fetched_at="2024-01-01T00:00:00Z",
+        method="aiohttp",
+        raw_bytes=text.encode("utf-8"),
+    )
+
+    artifacts = tmp_path / "artifacts"
+    apply_download_mode([result], artifacts, "rolling_extract", 120, 60, 5)
+
+    metadata = result.metadata or {}
+    windows_path = Path(metadata["rolling_windows_path"])
+    assert windows_path.exists()
+    with windows_path.open("r", encoding="utf-8") as fh:
+        windows = [json.loads(line) for line in fh]
+    assert len(windows) == metadata["rolling_windows_count"]
+    assert len(windows) <= 5
+    assert len(windows) >= 2
+    for window in windows:
+        assert window["text"].strip()
+        assert window["end"] > window["start"]
+        # Windows should end at sentence boundaries ('.', '!' or '?')
+        if window["end"] < len(text):
+            assert text[window["end"] - 1] in ".!?"
+
+
+def test_detect_paywall_flags_subscription_language() -> None:
+    html = """
+    <html><body>
+        <p>This article is for subscribers only. Please subscribe to continue reading this premium article.</p>
+    </body></html>
+    """
+    detection = paywall_detector.detect_paywall(
+        url="https://example.com/paywalled",
+        status=200,
+        html=html,
+    )
+    assert detection["verdict"] in {"maybe", "likely"}

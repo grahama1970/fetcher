@@ -17,6 +17,7 @@
 
 ## Outputs & auditability
 - `FetchResult` persists text digests and metadata to JSONL, suitable for knowledge stores.
+- `FETCHER_DOWNLOAD_MODE` controls whether bodies stay inline (`text`), are mirrored to disk (`download_only`), or mirrored plus chunked into rolling windows for stream ingestion (`rolling_extract`). Rolling windows respect spaCy sentence boundaries when available (regex fallback otherwise).
 - `FetcherResult.audit` summarizes outstanding controls, applied alternates, and per-domain failures.
 - Structured keys live in `fetcher.core.keys` so integrations never stringify magic keys.
 
