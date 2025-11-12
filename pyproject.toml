@@ -1,0 +1,57 @@
+#############################
+# fetcher – uv / hatch config #
+#############################
+
+[project]
+name = "fetcher"
+version = "0.1.0"
+description = "Standalone release of the SciLLM/Sparta fetcher pipeline with Brave + SciLLM alternates."
+readme = "README.md"
+authors = [{name = "Graham Anderson", email = "graham@grahama.co"}]
+license = {text = "MIT"}
+requires-python = ">=3.12"
+dependencies = [
+  "aiohttp>=3.10",
+  "beautifulsoup4>=4.12",
+  "python-dotenv>=1.0",
+  "requests>=2.32",
+  "lxml>=5.3",
+  "playwright>=1.48",
+  "pymupdf>=1.24",
+  "pytesseract>=0.3",
+  "pillow>=10.4",
+]
+
+[project.urls]
+Homepage = "https://github.com/grahama1970/fetcher"
+Documentation = "https://docs.litellm.ai/docs/fetcher"
+Source = "https://github.com/grahama1970/fetcher"
+
+[project.optional-dependencies]
+alternates = [
+  "brave-search>=0.1.8",
+  "scillm>=1.77.2",
+]
+dev = [
+  "pytest>=8.3",
+  "pytest-asyncio>=0.23",
+  "ruff>=0.6",
+  "mypy>=1.9",
+]
+
+[build-system]
+requires = ["hatchling>=1.24.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fetcher"]
+
+[dependency-groups]
+telemetry = ["jsonlines>=4.0"]
+
+[tool.mypy]
+python_version = "3.12"
+warn_unused_ignores = true
+
+[tool.ruff]
+line-length = 120

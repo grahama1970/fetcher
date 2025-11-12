@@ -1,0 +1,90 @@
+[
+  {
+    "domain": "cheatsheetseries.owasp.org",
+    "path_prefix": "/cheatsheets/Abuse_Case_Cheat_She",
+    "target_url": "https://cheatsheetseries.owasp.org/cheatsheets/Abuse_Case_Cheat_Sheet.html"
+  },
+  {
+    "domain": "twitter.com",
+    "target_template": "https://r.jina.ai/{original}"
+  },
+  {
+    "domain": "x.com",
+    "target_template": "https://r.jina.ai/{original}"
+  },
+  {
+    "domain": "atlas.mitre.org",
+    "path_prefix": "/matrices/ATLAS",
+    "target_url": "https://raw.githubusercontent.com/mitre-atlas/atlas-data/main/dist/ATLAS.yaml"
+  },
+  {
+    "domain": "securityboulevard.com",
+    "target_url": "https://www.splunk.com/en_us/blog/learn/watering-hole-attacks.html"
+  },
+  {
+    "domain": "spoonfeedin.blogspot.com.au",
+    "target_url": "https://www.ndss-symposium.org/wp-content/uploads/spacesec2024-87-paper.pdf"
+  },
+  {
+    "domain": "money.cnn.com",
+    "target_url": "https://www.usatoday.com/story/weather/2014/11/12/china-weather-satellite-attack/18915137/"
+  },
+  {
+    "substring": "news24.com",
+    "target_url": "https://www.voanews.com/a/a-13-a-2002-07-08-13-china-67573262/388684.html"
+  },
+  {
+    "domain": "www.gps.gov",
+    "path_prefix": "/resilience",
+    "target_url": "https://www.gps.gov/policies-and-documentation"
+  },
+  {
+    "domain": "www.gps.gov",
+    "path_prefix": "/technical-documentation",
+    "target_url": "https://www.gps.gov/policies-and-documentation"
+  },
+  {
+    "domain": "oig.nasa.gov",
+    "path_prefix": "/docs/FINAL_written_statement_for_",
+    "target_template": "https://web.archive.org/web/20220120150427/{original}"
+  },
+  {
+    "domain": "www.nasa.gov",
+    "path_prefix": "/mission_pages/rbsp/science",
+    "target_template": "https://web.archive.org/web/0/{original}"
+  },
+  {
+    "substring": "http://www.dtic.mil/dtic/tr/fulltext/u2/a487592.pdf",
+    "target_url": "https://web.archive.org/web/20170501004513/http://www.dtic.mil/dtic/tr/fulltext/u2/a487592.pdf"
+  },
+  {
+    "substring": "https://www.nasa.gov/mission_pages/rbsp/science/rbsp-spaceweather-human.html",
+    "target_url": "https://web.archive.org/web/20150930172326/http://www.nasa.gov/mission_pages/rbsp/science/rbsp-spaceweather-human.html"
+  },
+  {
+    "domain": "www.c4i.org",
+    "path_prefix": "/gps-adams.html",
+    "target_template": "https://web.archive.org/web/0/{original}"
+  },
+  {
+    "domain": "www.raeng.org.uk",
+    "path_prefix": "/publications/reports/global-navigation-space-systems",
+    "target_template": "https://web.archive.org/web/0/{original}"
+  },
+  {
+    "domain": "smcit-scc.space",
+    "path_prefix": "/tracks.html",
+    "target_template": "https://web.archive.org/web/0/{original}"
+  },
+  {
+    "domain": "waterfall-security.com",
+    "path_prefix": "/20-attacks",
+    "target_template": "https://web.archive.org/web/0/{original}"
+  }
+  ,
+  {
+    "domain": "www.dtic.mil",
+    "path_prefix": "/dtic/tr/fulltext/u2/",
+    "target_template": "https://web.archive.org/web/0/{original}"
+  }
+]
