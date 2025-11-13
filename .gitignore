@@ -21,3 +21,4 @@ venv/
 .cache/
 logs/
 .env
+run/
