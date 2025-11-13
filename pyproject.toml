@@ -9,7 +9,7 @@ description = "Standalone release of the SciLLM/Sparta fetcher pipeline with Bra
 readme = "README.md"
 authors = [{name = "Graham Anderson", email = "graham@grahama.co"}]
 license = {text = "MIT"}
-requires-python = ">=3.12"
+requires-python = ">=3.10"
 dependencies = [
   "aiohttp>=3.10",
   "beautifulsoup4>=4.12",
@@ -31,6 +31,9 @@ Documentation = "https://docs.litellm.ai/docs/fetcher"
 Source = "https://github.com/grahama1970/fetcher"
 
 [project.optional-dependencies]
+rolling = [
+  "spacy>=3.7,<4",
+]
 alternates = [
   "brave-search>=0.1.8",
   "scillm @ file:///home/graham/workspace/experiments/litellm",

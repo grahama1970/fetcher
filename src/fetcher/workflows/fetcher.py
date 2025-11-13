@@ -10,7 +10,7 @@ import mimetypes
 import os
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import threading
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Set
@@ -21,11 +21,6 @@ import requests
 from .web_fetch import FetchConfig, FetchResult, URLFetcher, write_results
 from .paywall_detector import detect_paywall
 from .paywall_utils import resolve_paywalled_entries, reload_overrides_cache
-
-try:  # Optional spaCy sentencizer
-    import spacy  # type: ignore
-except Exception:  # pragma: no cover - spaCy optional
-    spacy = None  # type: ignore
 from .fetcher_config import (
     BRAVE_ENDPOINT,
     HDR_ACCEPT,
@@ -33,6 +28,8 @@ from .fetcher_config import (
     PAYWALL_DOMAINS,
     PAYWALL_STATUS_CODES,
     PAYWALL_HINTS,
+    PAYWALL_SAFE_DOMAINS,
+    PAYWALL_SAFE_SUFFIXES,
     BRAVE_EXCLUDED_DOMAINS,
     LOCAL_SOURCES_DIR,
     OVERRIDES_PATH,
@@ -61,6 +58,7 @@ from .download_utils import (
     apply_download_mode,
     maybe_externalize_text,
 )
+from .outstanding_utils import build_outstanding_reports
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +73,7 @@ HDR_BRAVE_TOKEN = HDR_BRAVE_TOKEN
 PAYWALL_DOMAINS = PAYWALL_DOMAINS
 PAYWALL_STATUS_CODES = PAYWALL_STATUS_CODES
 PAYWALL_HINTS = PAYWALL_HINTS
+PAYWALL_SAFE_DOMAINS = PAYWALL_SAFE_DOMAINS
 BRAVE_EXCLUDED_DOMAINS = BRAVE_EXCLUDED_DOMAINS
 LOCAL_SOURCES_DIR = LOCAL_SOURCES_DIR
 OVERRIDES_PATH = OVERRIDES_PATH
@@ -98,13 +97,6 @@ def _normalize_download_mode(value: str | None) -> str:
     return mode
 
 
-DOWNLOAD_MODE = _normalize_download_mode(os.getenv("FETCHER_DOWNLOAD_MODE"))
-ROLLING_WINDOW_SIZE = max(1, _env_int("FETCHER_ROLLING_WINDOW_SIZE", 4000))
-ROLLING_WINDOW_STEP = max(1, _env_int("FETCHER_ROLLING_WINDOW_STEP", 2000))
-ROLLING_WINDOW_MAX_WINDOWS = max(0, _env_int("FETCHER_ROLLING_WINDOW_MAX_WINDOWS", 0))
-_SPACY_SENTENCIZER = None
-
-
 def _sanity_check_download_mode_config(
     mode: str,
     window_size: int,
@@ -120,7 +112,25 @@ def _sanity_check_download_mode_config(
         raise ValueError("FETCHER_ROLLING_WINDOW_STEP cannot exceed FETCHER_ROLLING_WINDOW_SIZE")
 
 
-_sanity_check_download_mode_config(DOWNLOAD_MODE, ROLLING_WINDOW_SIZE, ROLLING_WINDOW_STEP)
+def _resolve_download_config(
+    download_mode: Optional[str] = None,
+    window_size: Optional[int] = None,
+    window_step: Optional[int] = None,
+    max_windows: Optional[int] = None,
+) -> Tuple[str, int, int, int]:
+    """Resolve download knobs using overrides or environment defaults."""
+
+    mode = _normalize_download_mode(download_mode or os.getenv("FETCHER_DOWNLOAD_MODE"))
+    resolved_window_size = window_size if window_size is not None else max(1, _env_int("FETCHER_ROLLING_WINDOW_SIZE", 4000))
+    resolved_window_step = window_step if window_step is not None else max(1, _env_int("FETCHER_ROLLING_WINDOW_STEP", 2000))
+    resolved_max_windows = max_windows if max_windows is not None else max(0, _env_int("FETCHER_ROLLING_WINDOW_MAX_WINDOWS", 0))
+
+    _sanity_check_download_mode_config(mode, resolved_window_size, resolved_window_step)
+    return mode, resolved_window_size, resolved_window_step, resolved_max_windows
+
+
+# Validate defaults at import so misconfigured env fails fast without caching values.
+_resolve_download_config()
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,6 +153,8 @@ class FetcherPolicy:
     paywall_domains: Set[str]
     paywall_status_codes: Set[int]
     paywall_hints: Tuple[str, ...]
+    paywall_safe_domains: Set[str]
+    paywall_safe_suffixes: Tuple[str, ...]
     brave_excluded_domains: Set[str]
     overrides_path: Path
     local_sources_dir: Path
@@ -161,6 +173,8 @@ DEFAULT_POLICY = FetcherPolicy(
     paywall_domains=_normalize_set(PAYWALL_DOMAINS, {"www"}),
     paywall_status_codes={c for c in PAYWALL_STATUS_CODES if c != 404},
     paywall_hints=PAYWALL_HINTS,
+    paywall_safe_domains=_normalize_set(PAYWALL_SAFE_DOMAINS, {"www"}),
+    paywall_safe_suffixes=PAYWALL_SAFE_SUFFIXES,
     brave_excluded_domains=_normalize_set(BRAVE_EXCLUDED_DOMAINS, {"www"}),
     overrides_path=OVERRIDES_PATH,
     local_sources_dir=LOCAL_SOURCES_DIR,
@@ -198,14 +212,7 @@ def set_overrides_path(path: str | Path) -> None:
     p = Path(path)
     # Guard against concurrent mutation; intended for startup-time use only
     with _POLICY_LOCK:
-        DEFAULT_POLICY = FetcherPolicy(
-            paywall_domains=set(DEFAULT_POLICY.paywall_domains),
-            paywall_status_codes=set(DEFAULT_POLICY.paywall_status_codes),
-            paywall_hints=DEFAULT_POLICY.paywall_hints,
-            brave_excluded_domains=set(DEFAULT_POLICY.brave_excluded_domains),
-            overrides_path=p,
-            local_sources_dir=DEFAULT_POLICY.local_sources_dir,
-        )
+        DEFAULT_POLICY = replace(DEFAULT_POLICY, overrides_path=p)
 
 
 @dataclass(slots=True)
@@ -217,172 +224,6 @@ class FetcherResult:
     applied_alternates: List[Dict[str, Any]]
     outstanding_controls: int
     outstanding_urls: int
-
-
-
-def _build_outstanding_reports(
-    entries: Iterable[dict],
-    results: List[FetchResult],
-    run_artifacts_dir: Path,
-) -> Tuple[int, int]:
-    results_map: Dict[str, FetchResult] = {result.url: result for result in results}
-
-    outstanding_controls: List[Dict[str, Any]] = []
-    outstanding_urls: Dict[str, Dict[str, Any]] = {}
-
-    for entry in entries:
-        url = entry[K_URL].strip()
-        result = results_map.get(url)
-        status = result.status if result else -1
-        text_ok = bool(result and result.status == 200 and result.text)
-        if text_ok:
-            continue
-
-        failed_url = entry.get(K_ORIGINAL_URL, url)
-        domain = entry.get(K_DOMAIN) or (result.domain if result else "")
-        titles = entry.get(K_TITLES) or []
-        worksheets = entry.get(K_WORKSHEETS) or []
-        controls = entry.get(K_CONTROLS) or []
-
-        url_summary = outstanding_urls.setdefault(
-            failed_url,
-            {
-                K_URL: failed_url,
-                K_DOMAIN: domain,
-                K_STATUS: status,
-                "control_ids": set(),
-                "worksheets": set(worksheets),
-            },
-        )
-        url_summary["worksheets"].update(worksheets)
-
-        for idx, control_id in enumerate(controls):
-            title = titles[idx] if idx < len(titles) else ""
-            outstanding_controls.append(
-                {
-                    "control_id": control_id,
-                    "title": title,
-                    "failed_url": failed_url,
-                    "domain": domain,
-                    "worksheets": worksheets,
-                    "status": status,
-                }
-            )
-            url_summary["control_ids"].add(control_id)
-
-    outstanding_controls.sort(
-        key=lambda item: (item["domain"], item["failed_url"], item["control_id"])
-    )
-
-    url_rollup = []
-    for data in outstanding_urls.values():
-        url_rollup.append(
-            {
-                K_URL: data[K_URL],
-                K_DOMAIN: data[K_DOMAIN],
-                K_STATUS: data[K_STATUS],
-                "control_count": len(data["control_ids"]),
-                "worksheets": sorted(data["worksheets"]),
-            }
-        )
-
-    url_rollup.sort(key=lambda item: (item[K_DOMAIN], item[K_URL]))
-
-    run_artifacts_dir.mkdir(parents=True, exist_ok=True)
-    (run_artifacts_dir / "outstanding_controls_remaining.json").write_text(
-        json.dumps(outstanding_controls, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    (run_artifacts_dir / "outstanding_urls_summary.json").write_text(
-        json.dumps(url_rollup, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-
-    return len(outstanding_controls), len(url_rollup)
-
-
-
-def _build_outstanding_reports(
-    entries: Iterable[dict],
-    results: List[FetchResult],
-    run_artifacts_dir: Path,
-) -> Tuple[int, int]:
-    results_map: Dict[str, FetchResult] = {result.url: result for result in results}
-
-    outstanding_controls: List[Dict[str, Any]] = []
-    outstanding_urls: Dict[str, Dict[str, Any]] = {}
-
-    for entry in entries:
-        url = entry[K_URL].strip()
-        result = results_map.get(url)
-        status = result.status if result else -1
-        text_ok = bool(result and result.status == 200 and result.text)
-        if text_ok:
-            continue
-
-        failed_url = entry.get(K_ORIGINAL_URL, url)
-        domain = entry.get(K_DOMAIN) or (result.domain if result else "")
-        titles = entry.get(K_TITLES) or []
-        worksheets = entry.get(K_WORKSHEETS) or []
-        controls = entry.get(K_CONTROLS) or []
-
-        url_summary = outstanding_urls.setdefault(
-            failed_url,
-            {
-                K_URL: failed_url,
-                K_DOMAIN: domain,
-                K_STATUS: status,
-                "control_ids": set(),
-                "worksheets": set(worksheets),
-            },
-        )
-        url_summary["worksheets"].update(worksheets)
-
-        for idx, control_id in enumerate(controls):
-            title = titles[idx] if idx < len(titles) else ""
-            outstanding_controls.append(
-                {
-                    "control_id": control_id,
-                    "title": title,
-                    "failed_url": failed_url,
-                    "domain": domain,
-                    "worksheets": worksheets,
-                    "status": status,
-                }
-            )
-            url_summary["control_ids"].add(control_id)
-
-    outstanding_controls.sort(
-        key=lambda item: (item["domain"], item["failed_url"], item["control_id"])
-    )
-
-    url_rollup = []
-    for data in outstanding_urls.values():
-        url_rollup.append(
-            {
-                K_URL: data[K_URL],
-                K_DOMAIN: data[K_DOMAIN],
-                K_STATUS: data[K_STATUS],
-                "control_count": len(data["control_ids"]),
-                "worksheets": sorted(data["worksheets"]),
-            }
-        )
-
-    url_rollup.sort(key=lambda item: (item[K_DOMAIN], item[K_URL]))
-
-    run_artifacts_dir.mkdir(parents=True, exist_ok=True)
-    (run_artifacts_dir / "outstanding_controls_remaining.json").write_text(
-        json.dumps(outstanding_controls, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    (run_artifacts_dir / "outstanding_urls_summary.json").write_text(
-        json.dumps(url_rollup, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-
-    return len(outstanding_controls), len(url_rollup)
-
-
 
 def run_fetch_pipeline(
     entries: List[Dict[str, Any]],
@@ -396,6 +237,10 @@ def run_fetch_pipeline(
     enable_resolver: bool = True,
     policy: FetcherPolicy = DEFAULT_POLICY,
     progress_hook: Optional[Callable[[int, int], None]] = None,
+    download_mode: Optional[str] = None,
+    rolling_window_size: Optional[int] = None,
+    rolling_window_step: Optional[int] = None,
+    rolling_window_max_windows: Optional[int] = None,
 ) -> FetcherResult:
     """Primary entrypoint used by pipeline scripts."""
 
@@ -423,10 +268,11 @@ def run_fetch_pipeline(
     success = sum(1 for r in results if r.status == 200 and r.text)
     failed = sum(1 for r in results if r.status != 200)
 
-    outstanding_controls, outstanding_urls = _build_outstanding_reports(
+    outstanding_controls, outstanding_urls = build_outstanding_reports(
         entries,
         results,
         run_artifacts_dir,
+        policy,
     )
 
     audit_payload = {
@@ -438,13 +284,19 @@ def run_fetch_pipeline(
     audit_path.write_text(json.dumps(audit_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     maybe_externalize_text(results, run_artifacts_dir, policy.text_inline_max_bytes)
+    resolved_mode, resolved_window_size, resolved_window_step, resolved_max_windows = _resolve_download_config(
+        download_mode=download_mode,
+        window_size=rolling_window_size,
+        window_step=rolling_window_step,
+        max_windows=rolling_window_max_windows,
+    )
     apply_download_mode(
         results,
         run_artifacts_dir,
-        DOWNLOAD_MODE,
-        ROLLING_WINDOW_SIZE,
-        ROLLING_WINDOW_STEP,
-        ROLLING_WINDOW_MAX_WINDOWS,
+        resolved_mode,
+        resolved_window_size,
+        resolved_window_step,
+        resolved_max_windows,
     )
 
     write_results(results, output_path)
@@ -468,6 +320,10 @@ def deterministic_batch_check(
     run_artifacts_dir: Path,
     resolver_limit: int = 24,
     policy: FetcherPolicy = DEFAULT_POLICY,
+    download_mode: Optional[str] = None,
+    rolling_window_size: Optional[int] = None,
+    rolling_window_step: Optional[int] = None,
+    rolling_window_max_windows: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Run a deterministic batch fetch+resolve and report outstanding items.
 
@@ -492,6 +348,10 @@ def deterministic_batch_check(
         resolver_limit=resolver_limit,
         enable_resolver=True,
         policy=policy,
+        download_mode=download_mode,
+        rolling_window_size=rolling_window_size,
+        rolling_window_step=rolling_window_step,
+        rolling_window_max_windows=rolling_window_max_windows,
     )
 
     payload = {
@@ -514,6 +374,10 @@ def fetch_url(
     fetch_config: Optional[FetchConfig] = None,
     cache_path: Optional[Path] = None,
     run_artifacts_dir: Optional[Path] = None,
+    download_mode: Optional[str] = None,
+    rolling_window_size: Optional[int] = None,
+    rolling_window_step: Optional[int] = None,
+    rolling_window_max_windows: Optional[int] = None,
 ) -> FetchResult:
     """Fetch a single URL using the shared pipeline defaults."""
 
@@ -538,15 +402,22 @@ def fetch_url(
 
     annotate_paywall_metadata([result], DEFAULT_POLICY)
 
-    if DOWNLOAD_MODE != "text":
+    resolved_mode, resolved_window_size, resolved_window_step, resolved_max_windows = _resolve_download_config(
+        download_mode=download_mode,
+        window_size=rolling_window_size,
+        window_step=rolling_window_step,
+        max_windows=rolling_window_max_windows,
+    )
+
+    if resolved_mode != "text":
         artifacts_dir = run_artifacts_dir or Path(os.getenv("FETCHER_SINGLE_RUN_ARTIFACTS", "run")) / "artifacts"
         apply_download_mode(
             [result],
             artifacts_dir,
-            DOWNLOAD_MODE,
-            ROLLING_WINDOW_SIZE,
-            ROLLING_WINDOW_STEP,
-            ROLLING_WINDOW_MAX_WINDOWS,
+            resolved_mode,
+            resolved_window_size,
+            resolved_window_step,
+            resolved_max_windows,
         )
     else:
         result.raw_bytes = None
@@ -589,6 +460,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--per-domain", type=int, help="Max concurrent fetches per domain")
     parser.add_argument("--resolver-limit", type=int, default=24, help="Resolver limit per batch")
     parser.add_argument("--no-resolver", action="store_true", help="Disable alternate resolvers")
+    parser.add_argument("--download-mode", choices=["text", "download_only", "rolling_extract"], help="Override download mode for this run")
+    parser.add_argument("--window-size", type=int, help="Rolling window size (characters)")
+    parser.add_argument("--window-step", type=int, help="Rolling window hop (characters)")
+    parser.add_argument("--max-windows", type=int, help="Maximum rolling windows to emit (0 for unlimited)")
 
     args = parser.parse_args(argv)
 
@@ -605,7 +480,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             config.concurrency = args.concurrency
         if args.per_domain:
             config.per_domain = args.per_domain
-        result = fetch_url(args.url, fetch_config=config, cache_path=args.cache_path)
+        result = fetch_url(
+            args.url,
+            fetch_config=config,
+            cache_path=args.cache_path,
+            download_mode=args.download_mode,
+            rolling_window_size=args.window_size,
+            rolling_window_step=args.window_step,
+            rolling_window_max_windows=args.max_windows,
+        )
         payload = result.to_dict()
         if args.output:
             args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -645,6 +528,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         run_artifacts_dir=run_artifacts_dir,
         resolver_limit=args.resolver_limit,
         enable_resolver=not args.no_resolver,
+        download_mode=args.download_mode,
+        rolling_window_size=args.window_size,
+        rolling_window_step=args.window_step,
+        rolling_window_max_windows=args.max_windows,
     )
 
     summary = {

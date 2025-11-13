@@ -80,6 +80,50 @@ PAYWALL_HINTS = (
     "members only",
 )
 
+PAYWALL_SAFE_DOMAINS = {
+    "attack.mitre.org",
+    "d3fend.mitre.org",
+    "capec.mitre.org",
+    "cwe.mitre.org",
+    "csrc.nist.gov",
+    "nvlpubs.nist.gov",
+    "sparta.aerospace.org",
+    "arxiv.org",
+    "web.archive.org",
+    "csis-website-prod.s3.amazonaws.com",
+    "spacenews.com",
+    "breakingdefense.com",
+    "asiatimes.com",
+    "www.theguardian.com",
+    "www.theregister.co.uk",
+    "www.ndss-symposium.org",
+    "hsdl.org",
+    "www.forbes.com",
+    "www.businessinsider.com",
+    "www.bleepingcomputer.com",
+    "advanced-television.com",
+    "aerospace.csis.org",
+    "aerospaceamerica.aiaa.org",
+    "arstechnica.com",
+    "cybersecurityforme.com",
+    "deadline.com",
+    "english.manoramaonline.com",
+    "hackersonlineclub.com",
+    "media.kaspersky.com",
+    "jwillbold.com",
+    "csrc.nist.rip",
+    "spaceref.com",
+    "www.spaceref.com",
+    "sparta.aerospace.org",
+    "csis.org",
+    "aerospaceamerica.org",
+}
+
+PAYWALL_SAFE_SUFFIXES = (
+    ".gov",
+    ".mil",
+)
+
 BRAVE_EXCLUDED_DOMAINS = {
     "sparta.aerospace.org",
     "wikipedia.org",
@@ -88,4 +132,3 @@ BRAVE_EXCLUDED_DOMAINS = {
     "twitter.com",
     "x.com",
 }
-

@@ -63,6 +63,7 @@ DEFAULT_OVERRIDE_RULES: List[Dict[str, Any]] = [
 ]
 
 _OVERRIDE_RULES: Optional[List[Dict[str, Any]]] = None
+_PAYWALL_VERDICT_ALLOW = frozenset({"maybe", "likely"})
 
 
 def reload_overrides_cache() -> None:
@@ -103,6 +104,21 @@ def _merge_paywall_hints(policy: "FetcherPolicy") -> Tuple[str, ...]:
     except Exception:
         pass
     return policy.paywall_hints
+
+
+def _verdict_allows_resolver(result: Optional[FetchResult]) -> bool:
+    """Return True when verdict indicates we should keep resolving."""
+
+    if result is None:
+        return True
+    metadata = result.metadata or {}
+    verdict = metadata.get("paywall_verdict")
+    if verdict is None:
+        detection = metadata.get("paywall_detection") or {}
+        verdict = detection.get("verdict")
+    if verdict is None:
+        return True
+    return verdict in _PAYWALL_VERDICT_ALLOW
 
 
 def looks_paywalled_url(url: str, summary: Optional[str], policy: "FetcherPolicy") -> bool:
@@ -422,6 +438,8 @@ def resolve_paywalled_entries(
             continue
         if domain not in policy.paywall_domains:
             continue
+        if not _verdict_allows_resolver(result):
+            continue
 
         if original in pending:
             continue
@@ -566,10 +584,25 @@ def resolve_paywalled_entries(
     return applied
 
 
+def sanity_check() -> None:
+    class _Dummy:
+        def __init__(self, verdict: Optional[str]):
+            self.status = 200
+            self.metadata = {"paywall_verdict": verdict} if verdict else {}
+
+    assert not _verdict_allows_resolver(_Dummy("unlikely"))
+    assert _verdict_allows_resolver(_Dummy("maybe"))
+    assert _verdict_allows_resolver(None)
+
+
+sanity_check()
+
+
 __all__ = [
     "DEFAULT_OVERRIDE_RULES",
     "reload_overrides_cache",
     "looks_paywalled_url",
     "load_control_contexts",
     "resolve_paywalled_entries",
+    "sanity_check",
 ]

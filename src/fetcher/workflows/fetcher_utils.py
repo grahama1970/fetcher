@@ -37,6 +37,31 @@ def normalize_set(domains: Iterable[str], strip: Set[str]) -> Set[str]:
     return {normalize_domain(d, strip) for d in domains}
 
 
+def is_safe_domain(
+    domain: str,
+    safe_domains: Set[str],
+    safe_suffixes: Iterable[str],
+    strip_subdomains: Set[str] | None = None,
+) -> bool:
+    """Return True when the domain matches an explicit list or suffix."""
+
+    strip = strip_subdomains or set()
+    normalized = normalize_domain(domain, strip)
+    if not normalized:
+        return False
+    if normalized in safe_domains:
+        return True
+    for suffix in safe_suffixes:
+        token = (suffix or "").strip().lower()
+        if not token:
+            continue
+        if not token.startswith("."):
+            token = f".{token}"
+        if normalized.endswith(token):
+            return True
+    return False
+
+
 def resolve_repo_root(inventory_path: Path) -> Path:
     """Climb ancestors until a ``data/processed`` dir is found."""
 
@@ -53,9 +78,21 @@ def resolve_repo_root(inventory_path: Path) -> Path:
     return inventory_path.parent
 
 
+def sanity_check() -> None:
+    assert idna_normalize("ExAmple.COM") == "example.com"
+    assert normalize_domain("www.example.com", {"www"}) == "example.com"
+    assert "example.com" in normalize_set(["www.EXAMPLE.com"], {"www"})
+    assert is_safe_domain("test.example.gov", {"example.com"}, (".gov",), {"www"})
+    assert not is_safe_domain("medium.com", set(), (".gov",), {"www"})
+
+
+sanity_check()
+
 __all__ = [
     "idna_normalize",
     "normalize_domain",
     "normalize_set",
+    "is_safe_domain",
     "resolve_repo_root",
+    "sanity_check",
 ]

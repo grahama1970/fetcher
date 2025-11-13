@@ -17,6 +17,7 @@ except Exception:  # pragma: no cover - spaCy optional
     spacy = None  # type: ignore
 
 from .paywall_detector import detect_paywall
+from .fetcher_utils import is_safe_domain as _is_safe_domain
 from .web_fetch import FetchResult
 from ..core.keys import K_TEXT_PATH
 
@@ -299,6 +300,17 @@ def apply_download_mode(
 
 def annotate_paywall_metadata(results: Iterable[FetchResult], policy) -> None:
     for result in results:
+        domain = result.domain or urlparse(result.url).netloc
+        if domain and policy:
+            safe_suffixes = getattr(policy, "paywall_safe_suffixes", tuple())
+            strip = set(getattr(policy, "strip_subdomains", frozenset({"www"})))
+            if _is_safe_domain(domain, policy.paywall_safe_domains, safe_suffixes, strip):
+                metadata = dict(result.metadata or {})
+                metadata["paywall_detection"] = {"verdict": "safe", "score": 0.0}
+                metadata["paywall_verdict"] = "safe"
+                metadata["paywall_score"] = 0.0
+                result.metadata = metadata
+                continue
         if not result.text:
             continue
         ct = (result.content_type or "").lower()
@@ -320,9 +332,19 @@ def annotate_paywall_metadata(results: Iterable[FetchResult], policy) -> None:
         result.metadata = metadata
 
 
+def sanity_check() -> None:
+    sample = "Fetcher sanity sentence one. Sentence two ensures overlap."
+    windows = build_rolling_windows(sample, window_size=64, window_step=32, max_windows=0)
+    assert windows, "Rolling window builder returned no windows for sample text"
+    assert windows[0]["end"] > windows[0]["start"]
+
+
+sanity_check()
+
 __all__ = [
     "annotate_paywall_metadata",
     "apply_download_mode",
     "build_rolling_windows",
     "maybe_externalize_text",
+    "sanity_check",
 ]

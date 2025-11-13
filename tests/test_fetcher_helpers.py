@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from fetcher.workflows import fetcher, paywall_detector
+from fetcher.workflows import fetcher, paywall_detector, paywall_utils
 from fetcher.workflows.fetcher_utils import resolve_repo_root
 from fetcher.workflows.download_utils import (
     apply_download_mode,
@@ -139,3 +139,43 @@ def test_detect_paywall_flags_subscription_language() -> None:
         html=html,
     )
     assert detection["verdict"] in {"maybe", "likely"}
+
+
+def test_detect_paywall_respects_safe_domains() -> None:
+    html = """
+    <html><body><div>Please sign in to continue reading.</div></body></html>
+    """
+
+    class Policy:
+        paywall_safe_domains = {"attack.mitre.org"}
+
+    detection = paywall_detector.detect_paywall(
+        url="https://attack.mitre.org/mitigations/M1032/",
+        status=200,
+        html=html,
+        policy=Policy(),
+    )
+
+    assert detection["verdict"] == "unlikely"
+    assert detection["indicators"].get("safe_domain") == "attack.mitre.org"
+
+
+def test_paywall_verdict_gate_respects_annotations() -> None:
+    result = FetchResult(
+        url="https://example.com",
+        domain="example.com",
+        status=403,
+        content_type="text/html",
+        text="",
+        fetched_at="2024-01-01T00:00:00Z",
+        method="aiohttp",
+        metadata={"paywall_verdict": "unlikely"},
+    )
+
+    assert not paywall_utils._verdict_allows_resolver(result)
+
+    result.metadata["paywall_verdict"] = "maybe"
+    assert paywall_utils._verdict_allows_resolver(result)
+
+    result.metadata = {}
+    assert paywall_utils._verdict_allows_resolver(result)

@@ -20,6 +20,7 @@ from urllib.parse import urljoin, quote
 import os
 import warnings
 from .prefilters import evaluate_body_prefilter
+from . import github_utils
 
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
@@ -47,6 +48,47 @@ SPA_FALLBACK_DOMAINS = {
     "www.forbes.com",
     "www.gps.gov",
     "asiatimes.com",
+    "www.linkedin.com",
+    "linkedin.com",
+    "www.cisa.gov",
+    "cisa.gov",
+    "www.cnas.org",
+    "cnas.org",
+    "www.cpomagazine.com",
+    "cpomagazine.com",
+    "www.cyberdefensemagazine.com",
+    "cyberdefensemagazine.com",
+    "www.darkreading.com",
+    "darkreading.com",
+    "online.wsj.com",
+    "www.mdpi.com",
+    "mdpi.com",
+    "www.sentinelone.com",
+    "sentinelone.com",
+    "www.splunk.com",
+    "splunk.com",
+}
+
+SIGNIN_MODAL_DOMAINS = {
+    "www.linkedin.com",
+    "linkedin.com",
+    "www.cisa.gov",
+    "cisa.gov",
+    "www.cnas.org",
+    "cnas.org",
+    "www.cpomagazine.com",
+    "cpomagazine.com",
+    "www.cyberdefensemagazine.com",
+    "cyberdefensemagazine.com",
+    "www.darkreading.com",
+    "darkreading.com",
+    "online.wsj.com",
+    "www.mdpi.com",
+    "mdpi.com",
+    "www.sentinelone.com",
+    "sentinelone.com",
+    "www.splunk.com",
+    "splunk.com",
 }
 
 def _normalize_url(u: str) -> str:
@@ -477,6 +519,15 @@ class URLFetcher:
                         from_cache=False,
                         raw_bytes=local_bytes,
                     )
+                github_request = github_utils.prepare_github_request(url, url_norm)
+                if github_request is not None:
+                    github_result = await self._fetch_github_entry(
+                        github_request,
+                        base_metadata,
+                        session,
+                    )
+                    if github_result is not None:
+                        return github_result
                 status, content_type, text, method, extra_metadata, raw_bytes = await self._fetch_with_retries(
                     session, url_norm, domain
                 )
@@ -533,17 +584,75 @@ class URLFetcher:
                 raw_bytes=raw_bytes,
             )
 
+    async def _fetch_github_entry(
+        self,
+        request: github_utils.GithubRequest,
+        base_metadata: Dict[str, Any],
+        session: aiohttp.ClientSession,
+    ) -> Optional[FetchResult]:
+        try:
+            status, content_type, text, method, extra_metadata, raw_bytes = await self._fetch_with_retries(
+                session,
+                request.fetch_url,
+                request.domain,
+                extra_headers=request.headers,
+            )
+        except Exception:
+            status = -1
+            content_type = "error"
+            text = ""
+            method = "github_raw"
+            extra_metadata = {}
+            raw_bytes = None
+
+        if status != 200:
+            cli_result = await github_utils.fetch_with_cli(request)
+            if cli_result is None:
+                return None
+            status, content_type, text, method, extra_metadata, raw_bytes = cli_result
+
+        fetched_at = datetime.now(timezone.utc).isoformat()
+        cache_metadata = {**request.metadata, **(extra_metadata or {})}
+        metadata = {**base_metadata, **cache_metadata}
+        metadata.setdefault("github_fetch_url", request.fetch_url)
+        result = FetchResult(
+            url=request.original_url,
+            domain=urlparse(request.original_url).netloc.lower(),
+            status=status,
+            content_type=content_type,
+            text=text,
+            fetched_at=fetched_at,
+            method=method,
+            metadata=metadata,
+            from_cache=False,
+            raw_bytes=raw_bytes,
+        )
+
+        if status == 200 and text:
+            async with self._cache_lock:
+                self._cache[request.normalized_url] = {
+                    "status": status,
+                    "content_type": content_type,
+                    "text": text,
+                    "fetched_at": fetched_at,
+                    "method": method,
+                    "metadata": cache_metadata,
+                }
+                self._cache_dirty = True
+        return result
+
     async def _fetch_with_retries(
         self,
         session: aiohttp.ClientSession,
         url: str,
         domain: str,
+        extra_headers: Optional[Dict[str, str]] = None,
     ) -> Tuple[int, str, str, str, Dict[str, Any], Optional[bytes]]:
         delay = self.config.backoff_initial
         last_exc: Optional[Exception] = None
         for attempt in range(1, self.config.max_attempts + 1):
             try:
-                return await self._fetch_once(session, url, domain)
+                return await self._fetch_once(session, url, domain, extra_headers=extra_headers)
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 last_exc = exc
                 if attempt == self.config.max_attempts:
@@ -559,12 +668,19 @@ class URLFetcher:
         session: aiohttp.ClientSession,
         url: str,
         domain: str,
+        extra_headers: Optional[Dict[str, str]] = None,
     ) -> Tuple[int, str, str, str, Dict[str, Any], Optional[bytes]]:
         try:
             ssl_context = None
             if domain in self._insecure_ssl_domains:
                 ssl_context = False  # type: ignore[assignment]
-            async with session.get(url, timeout=self.config.timeout, ssl=ssl_context) as resp:
+            request_headers = extra_headers or None
+            async with session.get(
+                url,
+                timeout=self.config.timeout,
+                ssl=ssl_context,
+                headers=request_headers,
+            ) as resp:
                 status = resp.status
                 content_type = resp.headers.get("Content-Type", "text/html").split(";")[0]
                 encoding = (resp.headers.get("Content-Encoding") or "").lower()
@@ -603,7 +719,7 @@ class URLFetcher:
         fallback_allowed = domain in SPA_FALLBACK_DOMAINS and async_playwright is not None
 
         if status == 200 and not is_pdf:
-            if self._needs_playwright(text, content_type) and fallback_allowed:
+            if self._needs_playwright(text, content_type, domain) and fallback_allowed:
                 status, content_type, text, pw_meta, pw_bytes = await self._fetch_with_playwright(url, status)
                 method = "playwright"
                 extra_metadata.update(pw_meta)
@@ -929,11 +1045,13 @@ class URLFetcher:
         catalog = self._d3fend_cache.get(dataset) or {}
         return catalog.get(identifier)
 
-    def _needs_playwright(self, text: str, content_type: str) -> bool:
+    def _needs_playwright(self, text: str, content_type: str, domain: str) -> bool:
         if not self.config.verify_html:
             return False
         if "html" not in content_type.lower():
             return False
+        if domain in SIGNIN_MODAL_DOMAINS:
+            return True
         if len(text) < self.config.min_text_length:
             return True
         soup = BeautifulSoup(text, "lxml")
@@ -956,6 +1074,7 @@ class URLFetcher:
             browser = await p.chromium.launch(headless=True)
             context = await browser.new_context(user_agent=self.config.user_agent)
             page = await context.new_page()
+            dismissed_modal = False
             try:
                 response = await page.goto(
                     url,
@@ -963,6 +1082,10 @@ class URLFetcher:
                     wait_until="domcontentloaded",
                 )
                 await page.wait_for_timeout(2000)
+                domain = urlparse(url).netloc.lower()
+                dismissed_modal = await self._maybe_dismiss_signin_modal(page, domain)
+                if dismissed_modal:
+                    await page.wait_for_timeout(500)
                 content = await page.content()
                 status = response.status if response else 0
                 content_type = response.headers.get("content-type", "text/html") if response else "text/html"
@@ -972,8 +1095,40 @@ class URLFetcher:
         metadata: Dict[str, Any] = {"playwright": True}
         if origin_status is not None:
             metadata["fallback_from_status"] = origin_status
+        if dismissed_modal:
+            metadata["signin_modal_dismissed"] = True
         content_type_final = content_type.split(";")[0]
         return status, content_type_final, content, metadata, content.encode("utf-8", "ignore")
+
+    async def _maybe_dismiss_signin_modal(self, page, domain: str) -> bool:
+        """Attempt to close intrusive sign-in overlays for known domains."""
+
+        if domain not in SIGNIN_MODAL_DOMAINS:
+            return False
+
+        selectors = [
+            "button[aria-label='Dismiss']",
+            "button.artdeco-modal__dismiss",
+            "button[data-test-modal-close-btn]",
+            "button[aria-label='Dismiss alert']",
+        ]
+        for selector in selectors:
+            try:
+                await page.locator(selector).first.click(timeout=1500)
+                return True
+            except Exception:
+                continue
+
+        try:
+            await page.evaluate(
+                "() => {"
+                "document.querySelectorAll('.artdeco-modal, .artdeco-modal__overlay, .modal').forEach(el => el.remove());"
+                "document.querySelectorAll('.modal__backdrop, .artdeco-toast-item').forEach(el => el.remove());"
+                "}"
+            )
+            return True
+        except Exception:
+            return False
 
     def _fetch_from_file(self, parsed_url: Any) -> Tuple[int, str, str, str, Dict[str, Any], bytes]:
         def _is_within(child: Path, root: Path) -> bool:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from typing import Any, Dict, List, Mapping, Optional
+from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
 
@@ -48,8 +49,6 @@ DEFAULT_THRESHOLDS = {
 PAYWALL_STRONG_PHRASES = [
     r"\bsubscription required\b",
     r"\b(subscriber|members?) only\b",
-    r"\bsign in to (?:continue|read)\b",
-    r"\blog in to (?:continue|read)\b",
     r"\bthis article is for subscribers\b",
     r"\byou (?:have|used) [0-9]+ free articles\b",
     r"\bunlimited access\b",
@@ -63,6 +62,8 @@ PAYWALL_WEAK_PHRASES = [
     r"\bplease enable javascript\b",
     r"\bthis is a potential security issue\b",
     r"\byou are viewing this page in an unauthorized frame\b",
+    r"\bsign in to (?:continue|read)\b",
+    r"\blog in to (?:continue|read)\b",
 ]
 
 VENDOR_PATTERNS = [
@@ -232,8 +233,6 @@ def detect_paywall(
     extra_pay = [re.compile(p, re.I) for p in _get_policy_attr(policy, "paywall_hints", [])]
     extra_vendor = [re.compile(p, re.I) for p in _get_policy_attr(policy, "vendor_hints", [])]
 
-    text, noscript_text, soup_full = _extract_text(html or "")
-
     detection: Dict[str, Any] = {
         "url": url,
         "status": status,
@@ -244,6 +243,20 @@ def detect_paywall(
         "score_breakdown": {},
         "meta": {},
     }
+
+    text, noscript_text, soup_full = _extract_text(html or "")
+
+    safe_domains = _get_policy_attr(policy, "paywall_safe_domains", set()) or set()
+    try:
+        domain = urlparse(url or "").netloc.lower()
+    except Exception:
+        domain = ""
+    if domain and domain in safe_domains:
+        detection["indicators"]["safe_domain"] = domain
+        detection["verdict"] = "unlikely"
+        detection["meta"]["page_text_len"] = len(text)
+        detection["meta"]["article_len"] = _readability_len(html)
+        return detection
 
     if status in (401, 403, 451):
         detection["indicators"]["unauthorized_status"] = status
