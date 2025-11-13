@@ -1,0 +1,8 @@
+{
+  "timestamp": "2025-11-13T18:20:07.170254+00:00",
+  "requested": 100,
+  "fetched": 98,
+  "failed": 2,
+  "cache_hits": 0,
+  "success": 98
+}

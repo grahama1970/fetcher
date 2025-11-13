@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import csv
 import hashlib
+import re
 import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -19,8 +20,10 @@ from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning  # type: ignore
 from urllib.parse import urljoin, quote
 import os
 import warnings
+import requests
 from .prefilters import evaluate_body_prefilter
 from . import github_utils
+from .extract_utils import extract_content_features
 
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
@@ -153,6 +156,7 @@ class FetchConfig:
     verify_html: bool = True
     insecure_ssl_domains: Tuple[str, ...] = ()
     local_data_root: Optional[Path] = None
+    screenshots_dir: Optional[Path] = None
 
 
 @dataclass
@@ -424,18 +428,30 @@ class URLFetcher:
         semaphore: asyncio.Semaphore,
         per_domain: Dict[str, asyncio.Semaphore],
     ) -> FetchResult:
-        url = entry["url"].strip()
+        original_url = entry["url"].strip()
+        redirect_reason: Optional[str] = None
+        redirected = self._apply_static_redirects(original_url)
+        url = redirected or original_url
+        if redirected:
+            entry["url"] = url
         url_norm = _normalize_url(url)
         parsed = urlparse(url_norm)
         domain = parsed.netloc.lower()
+        if redirected:
+            redirect_reason = "static_redirect"
         base_metadata = {
             key: value
             for key, value in entry.items()
             if key not in {"url", "domain", "text", "status"}
         }
+        if redirected:
+            base_metadata["original_url"] = original_url
         if url_norm != url:
-            base_metadata["original_url"] = url
             base_metadata["url_normalized"] = url_norm
+        def _ensure_redirect(meta: Dict[str, Any]) -> Dict[str, Any]:
+            if redirect_reason and "redirect_reason" not in meta:
+                meta["redirect_reason"] = redirect_reason
+            return meta
 
         domain_sem = per_domain.setdefault(domain, asyncio.Semaphore(self.config.per_domain))
 
@@ -458,7 +474,7 @@ class URLFetcher:
                                 self._cache_dirty = True
                 except Exception:
                     pass
-                metadata = {**base_metadata, **cache_meta}
+                metadata = _ensure_redirect({**base_metadata, **cache_meta})
                 return FetchResult(
                     url=url,
                     domain=domain,
@@ -477,7 +493,7 @@ class URLFetcher:
                 if local_result is not None:
                     status, content_type, text, method, extra_metadata, local_bytes = local_result
                     fetched_at = datetime.now(timezone.utc).isoformat()
-                    metadata = {**base_metadata, **(extra_metadata or {})}
+                    metadata = _ensure_redirect({**base_metadata, **(extra_metadata or {})})
                     if status == 200 and text:
                         async with self._cache_lock:
                             self._cache[url_norm] = {
@@ -506,7 +522,7 @@ class URLFetcher:
                 if parsed.scheme == "file":
                     status, content_type, text, method, extra_metadata, local_bytes = self._fetch_from_file(parsed)
                     fetched_at = datetime.now(timezone.utc).isoformat()
-                    metadata = {**base_metadata, **(extra_metadata or {})}
+                    metadata = _ensure_redirect({**base_metadata, **(extra_metadata or {})})
                     return FetchResult(
                         url=url,
                         domain=domain,
@@ -559,7 +575,7 @@ class URLFetcher:
                     }
                     self._cache_dirty = True
                 error = None
-                metadata = {**base_metadata, **(extra_metadata or {})}
+                metadata = _ensure_redirect({**base_metadata, **(extra_metadata or {})})
             except Exception as exc:  # pragma: no cover - runtime failure path
                 status = -1
                 content_type = "error"
@@ -567,7 +583,11 @@ class URLFetcher:
                 fetched_at = datetime.now(timezone.utc).isoformat()
                 method = "error"
                 error = str(exc)
-                metadata = base_metadata
+                metadata = _ensure_redirect(dict(base_metadata))
+                if status in {404, 410, -1}:
+                    hint = self._brave_lookup(url)
+                    if hint:
+                        metadata["brave_suggestion"] = hint
                 raw_bytes = None
 
             return FetchResult(
@@ -716,10 +736,13 @@ class URLFetcher:
             body_bytes = raw_bytes
 
         fallback_statuses = {401, 403, 404, 429}
-        fallback_allowed = domain in SPA_FALLBACK_DOMAINS and async_playwright is not None
+        fallback_allowed = async_playwright is not None
+        domain_requires_spa = domain in SPA_FALLBACK_DOMAINS
+        needs_playwright = False
 
         if status == 200 and not is_pdf:
-            if self._needs_playwright(text, content_type, domain) and fallback_allowed:
+            needs_playwright = domain_requires_spa or self._needs_playwright(url, text, content_type, domain)
+            if needs_playwright and fallback_allowed:
                 status, content_type, text, pw_meta, pw_bytes = await self._fetch_with_playwright(url, status)
                 method = "playwright"
                 extra_metadata.update(pw_meta)
@@ -731,7 +754,7 @@ class URLFetcher:
                     extra_metadata.update(hub_meta)
             except Exception:
                 pass
-        elif fallback_allowed and status in fallback_statuses:
+        elif fallback_allowed and (domain_requires_spa or status in fallback_statuses):
             status_playwright, content_type_playwright, text_playwright, pw_meta, pw_bytes = await self._fetch_with_playwright(url, status)
             if text_playwright:
                 status = status_playwright or status
@@ -771,7 +794,81 @@ class URLFetcher:
                     extra_metadata.update(wb_meta)
                     body_bytes = wb_bytes
 
+        if status in {404, 410, -1}:
+            brave_hint = self._brave_lookup(url)
+            if brave_hint:
+                extra_metadata.setdefault("brave_suggestion", brave_hint)
+                alt_status = await self._attempt_alternate(brave_hint, session)
+                if alt_status is not None:
+                    alt_status, alt_content_type, alt_text, alt_method, alt_meta, alt_bytes = alt_status
+                    status = alt_status
+                    content_type = alt_content_type
+                    text = alt_text
+                    method = alt_method
+                    extra_metadata.update(alt_meta)
+                    extra_metadata.setdefault("alternate_note", "brave_redirect")
+                    body_bytes = alt_bytes
+
         return status, content_type, text, method, extra_metadata, body_bytes
+
+    def _brave_lookup(self, url: str) -> Optional[str]:
+        api_key = os.getenv("BRAVE_API_KEY")
+        if not api_key:
+            return None
+        try:
+            query = self._build_brave_query(url)
+            resp = requests.get(
+                "https://api.search.brave.com/res/v1/web/search",
+                params={"q": query, "count": 5},
+                headers={
+                    "Accept": "application/json",
+                    "X-Subscription-Token": api_key,
+                },
+                timeout=5,
+            )
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+        except Exception:
+            return None
+        results = data.get("web", {}).get("results", []) if isinstance(data, dict) else []
+        for item in results:
+            candidate = item.get("url")
+            if not candidate or candidate == url:
+                continue
+            parsed = urlparse(candidate)
+            if parsed.scheme in {"http", "https"} and parsed.netloc:
+                return candidate
+        return None
+
+    def _build_brave_query(self, url: str) -> str:
+        parsed = urlparse(url)
+        parts: List[str] = []
+        if parsed.path:
+            tail = parsed.path.rstrip("/").split("/")[-1]
+            tail = tail.replace(".html", "").replace(".pdf", "")
+            tokens = re.findall(r"[A-Za-z]+", tail)
+            if tokens:
+                parts.append(" ".join(tokens))
+        if parsed.netloc:
+            parts.append(parsed.netloc.replace("www.", ""))
+        query = " ".join(parts).strip()
+        return query or url
+
+    async def _attempt_alternate(
+        self,
+        alt_url: str,
+        session: aiohttp.ClientSession,
+    ) -> Optional[Tuple[int, str, str, str, Dict[str, Any], Optional[bytes]]]:
+        try:
+            return await self._fetch_with_retries(session, alt_url, urlparse(alt_url).netloc.lower())
+        except Exception:
+            return None
+
+    def _apply_static_redirects(self, url: str) -> Optional[str]:
+        if "d3f:CredentialRevoking" in url:
+            return url.replace("CredentialRevoking", "CredentialRevocation")
+        return None
 
     async def _fetch_from_wayback(
         self,
@@ -1045,7 +1142,7 @@ class URLFetcher:
         catalog = self._d3fend_cache.get(dataset) or {}
         return catalog.get(identifier)
 
-    def _needs_playwright(self, text: str, content_type: str, domain: str) -> bool:
+    def _needs_playwright(self, url: str, text: str, content_type: str, domain: str) -> bool:
         if not self.config.verify_html:
             return False
         if "html" not in content_type.lower():
@@ -1056,6 +1153,16 @@ class URLFetcher:
             return True
         soup = BeautifulSoup(text, "lxml")
         if not soup.find("body"):
+            return True
+        body = soup.find("body")
+        if body:
+            for tag in body.find_all(["script", "style", "noscript"]):
+                tag.extract()
+            stripped = body.get_text(" ", strip=True)
+            if len(stripped) < self.config.js_text_threshold:
+                return True
+        assessment = extract_content_features(text, content_type, url)
+        if assessment.text_len < self.config.js_text_threshold:
             return True
         # Detect common JS placeholders
         js_indicators = [
@@ -1075,6 +1182,7 @@ class URLFetcher:
             context = await browser.new_context(user_agent=self.config.user_agent)
             page = await context.new_page()
             dismissed_modal = False
+            screenshot_path: Optional[Path] = None
             try:
                 response = await page.goto(
                     url,
@@ -1086,6 +1194,15 @@ class URLFetcher:
                 dismissed_modal = await self._maybe_dismiss_signin_modal(page, domain)
                 if dismissed_modal:
                     await page.wait_for_timeout(500)
+                if self.config.screenshots_dir:
+                    try:
+                        self.config.screenshots_dir.mkdir(parents=True, exist_ok=True)
+                        sha = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
+                        ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+                        screenshot_path = self.config.screenshots_dir / f"{sha}-{ts}.png"
+                        await page.screenshot(path=str(screenshot_path), full_page=True)
+                    except Exception:
+                        screenshot_path = None
                 content = await page.content()
                 status = response.status if response else 0
                 content_type = response.headers.get("content-type", "text/html") if response else "text/html"
@@ -1097,6 +1214,8 @@ class URLFetcher:
             metadata["fallback_from_status"] = origin_status
         if dismissed_modal:
             metadata["signin_modal_dismissed"] = True
+        if screenshot_path is not None:
+            metadata["playwright_screenshot"] = str(screenshot_path)
         content_type_final = content_type.split(";")[0]
         return status, content_type_final, content, metadata, content.encode("utf-8", "ignore")
 

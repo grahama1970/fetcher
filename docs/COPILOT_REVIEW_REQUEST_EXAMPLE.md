@@ -97,4 +97,5 @@ In `sparta/workflows/paywall_detector.py`:
 
 ## Deliverable
 
-Reply with a single fenced code block containing only a unified diff that meets the constraints above.
+- Reply with a single fenced code block containing a unified diff that meets the constraints above
+- in the chat, provide answers to each clarifying questions

@@ -18,9 +18,13 @@ from urllib.parse import urlparse
 
 import requests
 
+from dotenv import load_dotenv
+
 from .web_fetch import FetchConfig, FetchResult, URLFetcher, write_results
 from .paywall_detector import detect_paywall
 from .paywall_utils import resolve_paywalled_entries, reload_overrides_cache
+
+load_dotenv(override=True)
 from .fetcher_config import (
     BRAVE_ENDPOINT,
     HDR_ACCEPT,
@@ -58,6 +62,7 @@ from .download_utils import (
     apply_download_mode,
     maybe_externalize_text,
 )
+from .extract_utils import evaluate_result_content
 from .outstanding_utils import build_outstanding_reports
 
 
@@ -244,8 +249,14 @@ def run_fetch_pipeline(
 ) -> FetcherResult:
     """Primary entrypoint used by pipeline scripts."""
 
+    if fetch_config.screenshots_dir is None:
+        fetch_config.screenshots_dir = run_artifacts_dir / "screenshots"
+
     fetcher = URLFetcher(fetch_config, cache_path=cache_path)
     results, audit = _run_in_fetch_loop(fetcher.fetch_many(entries, progress_hook=progress_hook))
+
+    for result in results:
+        evaluate_result_content(result)
 
     annotate_paywall_metadata(results, policy)
 
@@ -394,6 +405,9 @@ def fetch_url(
         K_WORKSHEETS: [],
     }
     config = fetch_config or FetchConfig()
+    artifacts_dir = run_artifacts_dir or Path(os.getenv("FETCHER_SINGLE_RUN_ARTIFACTS", "run")) / "artifacts"
+    if config.screenshots_dir is None:
+        config.screenshots_dir = artifacts_dir / "screenshots"
     fetcher = URLFetcher(config, cache_path=cache_path)
     results, _ = _run_in_fetch_loop(fetcher.fetch_many([entry]))
     if not results:
@@ -410,7 +424,6 @@ def fetch_url(
     )
 
     if resolved_mode != "text":
-        artifacts_dir = run_artifacts_dir or Path(os.getenv("FETCHER_SINGLE_RUN_ARTIFACTS", "run")) / "artifacts"
         apply_download_mode(
             [result],
             artifacts_dir,

@@ -30,7 +30,12 @@ def build_outstanding_reports(
     run_artifacts_dir: Path,
     policy: "FetcherPolicy",
 ) -> Tuple[int, int]:
-    results_map: Dict[str, FetchResult] = {result.url: result for result in results}
+    results_map: Dict[str, FetchResult] = {}
+    for result in results:
+        results_map[result.url] = result
+        original = (result.metadata or {}).get("original_url")
+        if original:
+            results_map.setdefault(original, result)
 
     outstanding_controls: List[Dict[str, Any]] = []
     outstanding_urls: Dict[str, Dict[str, Any]] = {}
@@ -133,6 +138,7 @@ def generate_outstanding_summary(
             status = -1
         result = results_map.get(url)
         metadata = result.metadata if result else {}
+        content_verdict = metadata.get("content_verdict")
         verdict = metadata.get("paywall_verdict")
         if verdict is None:
             detection = metadata.get("paywall_detection") or {}
@@ -145,6 +151,7 @@ def generate_outstanding_summary(
             verdict,
             safe_domain,
             policy,
+            content_verdict,
         )
         counts[category] = counts.get(category, 0) + 1
         items.append(
@@ -157,6 +164,7 @@ def generate_outstanding_summary(
                 "paywall_verdict": verdict,
                 "paywall_score": score,
                 "safe_domain": safe_domain,
+                "brave_suggestion": metadata.get("brave_suggestion"),
                 "category": category,
                 "notes": note,
                 "fetch_method": getattr(result, "method", None) if result else None,
@@ -177,19 +185,38 @@ def _categorize_outstanding(
     verdict: Optional[str],
     safe_domain: bool,
     policy: "FetcherPolicy",
+    content_verdict: Optional[str],
 ) -> Tuple[str, str]:
     lower_verdict = (verdict or "").lower()
-    if safe_domain and status not in {401, 403, 404, 410}:
-        return "needs_whitelist", "Domain matches safe-domain policy"
+    content_verdict = (content_verdict or "").lower()
 
     if status in {404, 410, 0, -1}:
         return "broken_or_moved", f"HTTP status {status}"
 
+    if status in {500, 502, 503}:
+        return "retry", f"HTTP status {status}"
+
     if status in {401, 403} and domain in (SIGNIN_MODAL_DOMAINS | SPA_FALLBACK_DOMAINS):
         return "needs_login_or_playwright", "Requires login or JS rendering"
 
-    if lower_verdict in {"likely", "maybe"} or status in policy.paywall_status_codes:
-        return "paywall", f"Paywall verdict {lower_verdict or 'unknown'}"
+    if lower_verdict in {"likely", "maybe"}:
+        return "paywall", f"Paywall verdict {lower_verdict}"
+
+    if content_verdict in {"paywall", "thin", "link_hub", "weak"}:
+        reason = "content_verdict=" + content_verdict
+        mapping = {
+            "paywall": "paywall",
+            "thin": "content_thin",
+            "link_hub": "content_link_hub",
+            "weak": "content_weak",
+        }
+        return mapping.get(content_verdict, "content_issue"), reason
+
+    if safe_domain:
+        return "needs_whitelist", "Domain matches safe-domain policy"
+
+    if status in policy.paywall_status_codes:
+        return "retry", f"HTTP status {status}"
 
     return "retry", "Fetch failed for unknown reasons"
 

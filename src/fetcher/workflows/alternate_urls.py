@@ -9,10 +9,7 @@ from urllib.parse import urlparse
 import sys
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-try:  # optional Brave Search integration
-    from brave import BraveSearch  # type: ignore
-except Exception:  # pragma: no cover
-    BraveSearch = None  # type: ignore
+import requests
 
 # CHUTES/SciLLM: use acompletion (Bearer + JSON mode) consistently
 try:
@@ -84,22 +81,28 @@ def _build_prompt(control: FailedControl) -> Dict[str, Any]:
 
 
 def _query_brave(control: FailedControl, *, max_hits: int = 5) -> List[AlternateSuggestion]:
-    if BraveSearch is None:
-        return []
     api_key = os.getenv("BRAVE_API_KEY")
     if not api_key:
         return []
-    try:
-        client = BraveSearch(api_key)
-    except Exception:
-        return []
+    endpoint = os.getenv("BRAVE_ENDPOINT", "https://api.search.brave.com/res/v1/web/search")
     title = control.title or control.source_title or control.control_id
     query = f"{title} {control.failed_url}".strip()
     try:
-        resp = client.search(query, count=max_hits)
+        resp = requests.get(
+            endpoint,
+            params={"q": query, "count": max_hits},
+            headers={
+                "Accept": "application/json",
+                "X-Subscription-Token": api_key,
+            },
+            timeout=5,
+        )
+        if resp.status_code != 200:
+            return []
+        payload = resp.json()
     except Exception:
         return []
-    results = resp.get("web", {}).get("results", []) if isinstance(resp, dict) else []
+    results = payload.get("web", {}).get("results", []) if isinstance(payload, dict) else []
     suggestions: List[AlternateSuggestion] = []
     for hit in results[:max_hits]:
         url = hit.get("url")

@@ -2,6 +2,7 @@ __pycache__/
 *.py[cod]
 *.log
 *.sqlite3
+*.jsonl
 .mypy_cache/
 .pytest_cache/
 ruff_cache/

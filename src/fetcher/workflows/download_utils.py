@@ -17,6 +17,7 @@ except Exception:  # pragma: no cover - spaCy optional
     spacy = None  # type: ignore
 
 from .paywall_detector import detect_paywall
+from .extract_utils import verify_blob_content
 from .fetcher_utils import is_safe_domain as _is_safe_domain
 from .web_fetch import FetchResult
 from ..core.keys import K_TEXT_PATH
@@ -97,6 +98,7 @@ def _persist_blob_for_result(result: FetchResult, download_dir: Path) -> Optiona
     blob_path = download_dir / f"{sha}{ext}"
     if not blob_path.exists():
         blob_path.write_bytes(data)
+        verify_blob_content(result, data)
 
     metadata = dict(result.metadata or {})
     metadata["blob_path"] = str(blob_path)

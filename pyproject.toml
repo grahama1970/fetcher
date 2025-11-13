@@ -23,6 +23,7 @@ dependencies = [
   "pillow>=10.4",
   "ftfy>=6.2",
   "readability-lxml>=0.8.1",
+  "trafilatura>=2.0.0",
 ]
 
 [project.urls]
@@ -35,7 +36,6 @@ rolling = [
   "spacy>=3.7,<4",
 ]
 alternates = [
-  "brave-search>=0.1.8",
   "scillm @ file:///home/graham/workspace/experiments/litellm",
 ]
 dev = [

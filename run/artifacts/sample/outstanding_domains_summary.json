@@ -1,0 +1,75 @@
+{
+  "generated_at": "2025-11-13T15:05:30.860925+00:00",
+  "total": 5,
+  "counts_by_category": {
+    "needs_whitelist": 3,
+    "broken_or_moved": 2
+  },
+  "items": [
+    {
+      "url": "https://d3fend.mitre.org/technique/d3f:CredentialRevoking/",
+      "domain": "d3fend.mitre.org",
+      "status": -1,
+      "worksheets": [],
+      "control_count": 0,
+      "paywall_verdict": "safe",
+      "paywall_score": 0.0,
+      "safe_domain": true,
+      "category": "needs_whitelist",
+      "notes": "Domain matches safe-domain policy",
+      "fetch_method": "error"
+    },
+    {
+      "url": "https://www.cisa.gov/defining-insider-threats",
+      "domain": "www.cisa.gov",
+      "status": -1,
+      "worksheets": [],
+      "control_count": 0,
+      "paywall_verdict": "safe",
+      "paywall_score": 0.0,
+      "safe_domain": true,
+      "category": "needs_whitelist",
+      "notes": "Domain matches safe-domain policy",
+      "fetch_method": "error"
+    },
+    {
+      "url": "https://www.cnas.org/publications/reports/the-influence-of-commercial-space-capabilities-on-deterrence",
+      "domain": "www.cnas.org",
+      "status": -1,
+      "worksheets": [],
+      "control_count": 0,
+      "paywall_verdict": null,
+      "paywall_score": null,
+      "safe_domain": false,
+      "category": "broken_or_moved",
+      "notes": "HTTP status -1",
+      "fetch_method": "error"
+    },
+    {
+      "url": "https://www.cse.msu.edu/~alexliu/publications/SensorSideChannel/SensorSideChannel.pdf",
+      "domain": "www.cse.msu.edu",
+      "status": -1,
+      "worksheets": [],
+      "control_count": 0,
+      "paywall_verdict": null,
+      "paywall_score": null,
+      "safe_domain": false,
+      "category": "broken_or_moved",
+      "notes": "HTTP status -1",
+      "fetch_method": "error"
+    },
+    {
+      "url": "https://www.nsa.gov/Portals/75/documents/resources/everyone/csfc/capability-packages/(U)%20Key%20Management%20Requirements%20Annex%20v2.0.pdf",
+      "domain": "www.nsa.gov",
+      "status": -1,
+      "worksheets": [],
+      "control_count": 0,
+      "paywall_verdict": "safe",
+      "paywall_score": 0.0,
+      "safe_domain": true,
+      "category": "needs_whitelist",
+      "notes": "Domain matches safe-domain policy",
+      "fetch_method": "error"
+    }
+  ]
+}

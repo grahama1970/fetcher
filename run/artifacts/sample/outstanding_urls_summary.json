@@ -1,0 +1,37 @@
+[
+  {
+    "url": "https://d3fend.mitre.org/technique/d3f:CredentialRevoking/",
+    "domain": "d3fend.mitre.org",
+    "status": -1,
+    "control_count": 0,
+    "worksheets": []
+  },
+  {
+    "url": "https://www.cisa.gov/defining-insider-threats",
+    "domain": "www.cisa.gov",
+    "status": -1,
+    "control_count": 0,
+    "worksheets": []
+  },
+  {
+    "url": "https://www.cnas.org/publications/reports/the-influence-of-commercial-space-capabilities-on-deterrence",
+    "domain": "www.cnas.org",
+    "status": -1,
+    "control_count": 0,
+    "worksheets": []
+  },
+  {
+    "url": "https://www.cse.msu.edu/~alexliu/publications/SensorSideChannel/SensorSideChannel.pdf",
+    "domain": "www.cse.msu.edu",
+    "status": -1,
+    "control_count": 0,
+    "worksheets": []
+  },
+  {
+    "url": "https://www.nsa.gov/Portals/75/documents/resources/everyone/csfc/capability-packages/(U)%20Key%20Management%20Requirements%20Annex%20v2.0.pdf",
+    "domain": "www.nsa.gov",
+    "status": -1,
+    "control_count": 0,
+    "worksheets": []
+  }
+]
