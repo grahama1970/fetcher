@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable, List, Set
+from typing import Iterable, List, Set, TYPE_CHECKING
+
+from ..core.keys import K_TEXT_PATH
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from .web_fetch import FetchResult
 
 
 def idna_normalize(host: str) -> str:
@@ -78,6 +83,17 @@ def resolve_repo_root(inventory_path: Path) -> Path:
     return inventory_path.parent
 
 
+def has_text_payload(result: "FetchResult | None") -> bool:
+    """Return True if a fetch result still has inline text or an external blob."""
+
+    if result is None:
+        return False
+    if getattr(result, "text", None):
+        return True
+    metadata = getattr(result, "metadata", None) or {}
+    return bool(metadata.get(K_TEXT_PATH))
+
+
 def sanity_check() -> None:
     assert idna_normalize("ExAmple.COM") == "example.com"
     assert normalize_domain("www.example.com", {"www"}) == "example.com"
@@ -94,5 +110,6 @@ __all__ = [
     "normalize_set",
     "is_safe_domain",
     "resolve_repo_root",
+    "has_text_payload",
     "sanity_check",
 ]

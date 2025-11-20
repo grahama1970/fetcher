@@ -85,8 +85,8 @@ Acceptance criteria for this test:
    technique page should appear as `broken_or_moved` or `link_hub`.
 2. All `status == 200` rows in `docs/fetcher_sample_urls.results.jsonl` MUST have
    `content_verdict == "ok"` for narrative pages (D3FEND techniques, CNAS, etc.).
-   Non-article hubs may remain `link_hub` only if the page truly lacks prose and
-   is intended as a TOC.
+   The JSONL stores only metadata + `text_path` pointers; raw HTML/text blobs live
+   under `run/artifacts/text_blobs/` and must not be checked into git.
 3. GitHub rewrites (blob -> raw) include `github_fetch_url` metadata and the
    saved blob exists on disk.
 4. No result with `content_verdict != "ok"` persists blobs or rolling windows.

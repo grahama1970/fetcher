@@ -41,13 +41,17 @@ fetcher/
 - Drop any mirrored PDFs or TXT files into `src/fetcher/data/local_sources/` if you need deterministic replacements.
 - Populate `src/fetcher/data/processed/controls_context.jsonl` with optional control metadata to enrich alternate generation.
 
-Large crawls can keep JSONL outputs manageable by exporting `FETCHER_TEXT_INLINE_MAX_BYTES` (e.g., `FETCHER_TEXT_INLINE_MAX_BYTES=200000`). When set, oversized response bodies are written to `run/artifacts/text_blobs/` and the JSON metadata stores a pointer via `text_path`.
+By default `FETCHER_TEXT_INLINE_MAX_BYTES=0`, so **all** response bodies are externalized to
+`run/artifacts/text_blobs/` and the JSON metadata only stores a pointer via `text_path`. Set the
+environment variable to a positive byte threshold (e.g., `FETCHER_TEXT_INLINE_MAX_BYTES=200000`)
+if you want small payloads to remain inline inside the `.results.jsonl` file.
 
 ## Download modes & rolling windows
 
 Use `FETCHER_DOWNLOAD_MODE` to control how response bodies are stored:
 
-- `text` (default): inline text in JSON unless `FETCHER_TEXT_INLINE_MAX_BYTES` externalizes it.
+- `text` (default): records only metadata in JSON and stores the raw body under `text_path` unless you
+  explicitly raise `FETCHER_TEXT_INLINE_MAX_BYTES`.
 - `download_only`: persist every body (binary or text) to `run/artifacts/downloads/<sha>.<ext>` and zero the inline `text` field.
 - `rolling_extract`: keep the download + emit JSONL rolling windows under `run/artifacts/rolling_windows/` using `FETCHER_ROLLING_WINDOW_SIZE`, `FETCHER_ROLLING_WINDOW_STEP`, and optional `FETCHER_ROLLING_WINDOW_MAX_WINDOWS`. Windows follow spaCy sentence boundaries when spaCy is installed (otherwise fall back to a regex splitter) so no chunk cuts off a sentence mid-way.
 

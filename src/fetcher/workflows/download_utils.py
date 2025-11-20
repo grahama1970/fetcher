@@ -43,9 +43,9 @@ def _get_spacy_sentencizer():
 def maybe_externalize_text(
     results: Iterable[FetchResult],
     run_artifacts_dir: Path,
-    max_inline_bytes: int,
+    max_inline_bytes: Optional[int],
 ) -> None:
-    if max_inline_bytes <= 0:
+    if max_inline_bytes is None or max_inline_bytes < 0:
         return
 
     text_root = run_artifacts_dir / "text_blobs"
@@ -56,7 +56,7 @@ def maybe_externalize_text(
         if not text:
             continue
         text_bytes = text.encode("utf-8")
-        if len(text_bytes) <= max_inline_bytes:
+        if max_inline_bytes > 0 and len(text_bytes) <= max_inline_bytes:
             continue
 
         sha = hashlib.sha256(text_bytes).hexdigest()

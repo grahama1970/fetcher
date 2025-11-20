@@ -24,6 +24,7 @@ import requests
 from .prefilters import evaluate_body_prefilter
 from . import github_utils
 from .extract_utils import extract_content_features
+from .fetcher_utils import has_text_payload
 
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
@@ -1347,7 +1348,7 @@ class URLFetcher:
             doc.close()
 
     def _build_audit(self, results: List[FetchResult], target_total: int, *, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        successes = sum(1 for r in results if r.status == 200 and r.text)
+        successes = sum(1 for r in results if r.status == 200 and has_text_payload(r))
         failures = sum(1 for r in results if r.status != 200)
         audit = {
             "timestamp": datetime.now(timezone.utc).isoformat(),

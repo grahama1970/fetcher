@@ -44,7 +44,7 @@ def build_outstanding_reports(
         url = entry[K_URL].strip()
         result = results_map.get(url)
         status = result.status if result else -1
-        text_ok = bool(result and result.status == 200 and result.text)
+        text_ok = bool(result and result.status == 200 and fetcher_utils.has_text_payload(result))
         if text_ok:
             continue
 

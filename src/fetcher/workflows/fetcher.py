@@ -52,6 +52,7 @@ from ..core.keys import (
     K_TEXT_PATH,
 )
 from .fetcher_utils import (
+    has_text_payload,
     idna_normalize as _idna_normalize,
     normalize_domain as _normalize_domain,
     normalize_set as _normalize_set,
@@ -276,7 +277,7 @@ def run_fetch_pipeline(
             run_fetch_loop=_run_in_fetch_loop,
         )
 
-    success = sum(1 for r in results if r.status == 200 and r.text)
+    success = sum(1 for r in results if r.status == 200 and has_text_payload(r))
     failed = sum(1 for r in results if r.status != 200)
 
     outstanding_controls, outstanding_urls = build_outstanding_reports(
