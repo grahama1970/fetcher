@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 from fetcher.workflows import fetcher, paywall_detector, paywall_utils
-from fetcher.workflows.fetcher import _annotate_content_changes
+from fetcher.workflows.fetcher import _annotate_content_changes, _write_change_feed
 from fetcher.workflows.fetcher_utils import resolve_repo_root
 from fetcher.workflows.download_utils import (
     apply_download_mode,
@@ -150,6 +150,45 @@ def test_content_change_tracker_detects_delta(tmp_path: Path) -> None:
     _annotate_content_changes([r3], cache_path)
     assert r3.metadata.get("content_changed") is True
     assert r3.metadata.get("content_previous_sha256") == r2.metadata.get("content_sha256")
+
+
+def test_write_change_feed(tmp_path: Path) -> None:
+    run_dir = tmp_path / "artifacts"
+    results = [
+        FetchResult(
+            url="https://example.com/one",
+            domain="example.com",
+            status=200,
+            content_type="text/html",
+            text="",
+            fetched_at="today",
+            method="aiohttp",
+            metadata={
+                "content_changed": True,
+                "content_sha256": "abc",
+                "content_previous_sha256": "def",
+                "content_previous_fetched_at": "yesterday",
+            },
+        ),
+        FetchResult(
+            url="https://example.com/two",
+            domain="example.com",
+            status=200,
+            content_type="text/html",
+            text="",
+            fetched_at="today",
+            method="aiohttp",
+            metadata={"content_changed": False},
+        ),
+    ]
+    _write_change_feed(results, run_dir)
+    changes_path = run_dir / "changes.jsonl"
+    assert changes_path.exists()
+    lines = changes_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1
+    payload = json.loads(lines[0])
+    assert payload["url"] == "https://example.com/one"
+    assert payload["content_previous_sha256"] == "def"
 
 
 def test_summarize_rate_limits_helper() -> None:

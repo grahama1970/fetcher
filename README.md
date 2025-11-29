@@ -136,6 +136,7 @@ Every batch run writes telemetry to `run/artifacts/<run-id>/`, including:
 - `alternate_urls_applied.jsonl` (when Brave/Wayback alternates succeed)
 - `junk_results.jsonl` + `junk_summary.json` (every non-`ok` `content_verdict` for human/agent review)
 - `text_blobs/` and `downloads/` (the actual files referenced by `file_path` in the `.results.jsonl` output)
+- `changes.jsonl` – one line per URL whose content changed this run, including previous hash/timestamp and the latest diff ratio.
 
 Audit files now also embed `rate_limit_metrics` (overall runtime, effective RPS, per-domain 429 stats)
 and, when configured, a `proxy_rotation` block so operators can trace throttling and rotation usage

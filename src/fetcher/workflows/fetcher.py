@@ -332,6 +332,35 @@ def _annotate_content_changes(results: List[FetchResult], cache_path: Path) -> N
         cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _write_change_feed(results: Iterable[FetchResult], artifacts_dir: Path) -> None:
+    path = artifacts_dir / "changes.jsonl"
+    entries: List[str] = []
+    for result in results:
+        metadata = result.metadata or {}
+        if not metadata.get("content_changed"):
+            continue
+        record = {
+            "url": result.url,
+            "domain": result.domain,
+            "fetched_at": result.fetched_at,
+            "previous_fetched_at": metadata.get("content_previous_fetched_at"),
+            "content_sha256": metadata.get("content_sha256"),
+            "content_previous_sha256": metadata.get("content_previous_sha256"),
+            "content_diff_ratio": metadata.get("content_diff_ratio"),
+            "text_path": metadata.get(K_TEXT_PATH) or metadata.get("file_path"),
+            "blob_path": metadata.get("blob_path"),
+        }
+        entries.append(json.dumps(record, ensure_ascii=False))
+
+    if not entries:
+        if path.exists():
+            path.unlink()
+        return
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(entries) + "\n", encoding="utf-8")
+
+
 @dataclass(slots=True)
 class FetcherResult:
     """Outcome payload returned to pipeline steps."""
@@ -428,6 +457,8 @@ def run_fetch_pipeline(
         resolved_window_step,
         resolved_max_windows,
     )
+
+    _write_change_feed(results, run_artifacts_dir)
 
     write_results(results, output_path)
     _write_junk_report(results, run_artifacts_dir)
