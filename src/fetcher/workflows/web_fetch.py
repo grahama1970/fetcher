@@ -2203,6 +2203,8 @@ class URLFetcher:
                 "toc_drop_reasons": extra.get("toc_drop_reasons", {}),
                 "toc_drop_examples": extra.get("toc_drop_examples", []),
             })
+            if extra.get("proxy_rotation"):
+                audit["proxy_rotation"] = extra.get("proxy_rotation")
         return audit
 
 # ---------- Helpers for path allowlists (domain-specific) ----------
