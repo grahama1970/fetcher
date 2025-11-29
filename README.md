@@ -42,15 +42,18 @@ fetcher/
 - Populate `src/fetcher/data/processed/controls_context.jsonl` with optional control metadata to enrich alternate generation.
 
 By default `FETCHER_TEXT_INLINE_MAX_BYTES=0`, so **all** response bodies are externalized to
-`run/artifacts/text_blobs/` and the JSON metadata only stores a pointer via `text_path`. Set the
-environment variable to a positive byte threshold (e.g., `FETCHER_TEXT_INLINE_MAX_BYTES=200000`)
-if you want small payloads to remain inline inside the `.results.jsonl` file.
+`run/artifacts/text_blobs/` and the JSON metadata only stores a pointer via `file_path`
+(`text_path` remains for backward compatibility). Set the environment variable to a positive byte
+threshold (e.g., `FETCHER_TEXT_INLINE_MAX_BYTES=200000`) if you want small payloads to remain
+inline inside the `.results.jsonl` file. When text is externalized, fetcher records
+`text_externalized`, `text_inline_missing`, and `text_length_chars` on each result so downstream
+pipelines know the original length even though the inline `text` field is blank.
 
 ## Download modes & rolling windows
 
 Use `FETCHER_DOWNLOAD_MODE` to control how response bodies are stored:
 
-- `text` (default): records only metadata in JSON and stores the raw body under `text_path` unless you
+- `text` (default): records only metadata in JSON and stores the raw body under `file_path` unless you
   explicitly raise `FETCHER_TEXT_INLINE_MAX_BYTES`.
 - `download_only`: persist every body (binary or text) to `run/artifacts/downloads/<sha>.<ext>` and zero the inline `text` field.
 - `rolling_extract`: keep the download + emit JSONL rolling windows under `run/artifacts/rolling_windows/` using `FETCHER_ROLLING_WINDOW_SIZE`, `FETCHER_ROLLING_WINDOW_STEP`, and optional `FETCHER_ROLLING_WINDOW_MAX_WINDOWS`. Windows follow spaCy sentence boundaries when spaCy is installed (otherwise fall back to a regex splitter) so no chunk cuts off a sentence mid-way.
@@ -58,6 +61,64 @@ Use `FETCHER_DOWNLOAD_MODE` to control how response bodies are stored:
 Each HTML result also records a `paywall_detection` blob (score, verdict, indicators) derived from the Sparta detector so downstream agents can decide when to request alternates.
 
 These files are referenced via `blob_path`/`rolling_windows_path` in `FetchResult.metadata`, giving downstream tools (extractor, MCPs, etc.) a deterministic attachment to hand to format-specific providers.
+
+### Optional PDF password cracking
+
+If you need to unlock lightly protected PDFs (short PINs/dictionaries), install the optional helper and enable the env toggle:
+
+```
+uv add pdferli  # or pip install pdferli
+export FETCHER_PDF_CRACK_ENABLE=1
+export FETCHER_PDF_CRACK_CHARSET=0123456789
+export FETCHER_PDF_CRACK_MINLEN=4
+export FETCHER_PDF_CRACK_MAXLEN=6
+# optional: FETCHER_PDF_CRACK_PROCESSES, FETCHER_PDF_CRACK_TIMEOUT
+```
+
+Fetcher will attempt a bounded brute-force when `pdf.needs_pass` is detected. Successful cracks proceed with normal extraction; failures are tagged `content_verdict="password_protected"` and skip downstream chunking.
+
+## Link-hub fan-out
+
+When a page is flagged as a link hub (ATT&CK mitigations, NIST glossary tables, etc.) fetcher can
+automatically queue the linked resources (one level deep). Controls:
+
+- `SPARTA_TOC_FANOUT=1` (default) enables the behavior.
+- `SPARTA_TOC_PATH_ALLOWLIST_JSON` restricts fan-out to explicit `{ "host": ["/prefix"] }` paths.
+- `SPARTA_TOC_ALLOWLIST_DISABLE_DEFAULTS=1` disables the built-in CSRC path list.
+- `SPARTA_TOC_FANOUT_DOMAINS` (comma-separated suffixes) lets entire domains fan out regardless of
+  path. Defaults include `mitre.org`, `d3fend.mitre.org`, `sparta.aerospace.org`, and `nist.gov`, so
+  ATT&CK/D3FEND/Sparta/NIST hubs automatically fetch their same-domain children.
+
+## Rotating proxy fallback (Step 06)
+
+Step 06 crawls can now re-issue rate-limited requests through a rotating proxy (e.g., IPRoyal) before falling back to Wayback. The loader understands the same env variables documented in `memory/scripts/smokes/iproyal_login.py` and `graph-memory-operator/scripts/smokes/iproyal_curl_smoke.sh`, so you can reuse existing secrets.
+
+```
+export SPARTA_STEP06_PROXY_HOST=gw.iproyal.com
+export SPARTA_STEP06_PROXY_PORT=12321
+export SPARTA_STEP06_PROXY_USER=team
+export SPARTA_STEP06_PROXY_PASSWORD=super-secret
+# Optional knobs
+export SPARTA_STEP06_PROXY_DOMAINS=d3fend.mitre.org,atlas.mitre.org
+export SPARTA_STEP06_PROXY_STATUSES=429,403
+export SPARTA_STEP06_PROXY_HINTS="rate limit,too many requests"
+```
+
+- `SPARTA_STEP06_PROXY_URL=http://user:pass@gw.iproyal.com:12321` or `SPARTA_STEP06_PROXY_CREDENTIALS=user:pass` can replace the separate host/user/pass envs.
+- Defaults only target `d3fend.mitre.org`; override with `SPARTA_STEP06_PROXY_DOMAINS` or disable the default via `SPARTA_STEP06_PROXY_DOMAINS_DISABLE_DEFAULTS=1`.
+- Trigger statuses default to `429`; textual hints catch throttling pages ("rate limit", "retry later").
+- Set `SPARTA_STEP06_PROXY_DISABLE=1` to turn the feature off without clearing secrets. If Step 06 envs are missing the loader falls back to `IPROYAL_HOST|PORT|USER|PASSWORD` so the smoke scripts and fetcher stay aligned.
+
+Whenever a throttled response matches the allowlist, Fetcher retries the same URL through the proxy. Proxied rows add `proxy_rotation_*` metadata to each `FetchResult`, and the Step 06 audit JSON inherits a `proxy_rotation` summary (`attempted`, `success`, per-domain breakdown, recent errors) so operators can trace every rotation alongside the existing TOC telemetry.
+
+## Run artifacts
+
+Every batch run writes telemetry to `run/artifacts/<run-id>/`, including:
+
+- `outstanding_controls_remaining.json`, `outstanding_urls_summary.json`, `outstanding_domains_summary.json`
+- `alternate_urls_applied.jsonl` (when Brave/Wayback alternates succeed)
+- `junk_results.jsonl` + `junk_summary.json` (every non-`ok` `content_verdict` for human/agent review)
+- `text_blobs/` and `downloads/` (the actual files referenced by `file_path` in the `.results.jsonl` output)
 
 ## Relationship to LiteLLM / SciLLM
 

@@ -15,11 +15,18 @@
 - Local mirror resolution, path regex routing, and Brave search suggestions share a single audit log.
 - Optional SciLLM JSON-mode workflow (`CHUTES_*` env) generates contextual alternates tied to control metadata.
 
+## Rate-limit mitigation
+- Step 06 proxy rotation: when `SPARTA_STEP06_PROXY_*` env vars (or `IPROYAL_*` fallbacks) are present, throttled requests to allowlisted domains (default `d3fend.mitre.org`) are automatically retried through the configured rotating proxy before Wayback/Jina.
+- Triggers are configurable via `SPARTA_STEP06_PROXY_DOMAINS`, `SPARTA_STEP06_PROXY_STATUSES`, and `SPARTA_STEP06_PROXY_HINTS`; disable defaults with `SPARTA_STEP06_PROXY_DOMAINS_DISABLE_DEFAULTS=1` or turn the feature off entirely via `SPARTA_STEP06_PROXY_DISABLE=1`.
+- Fetch results carry `proxy_rotation_*` metadata (provider, reason, endpoint, error) and the Step 06 audit gains a `proxy_rotation` summary (attempts, successes, per-domain counts) so Ops can trace exactly when IP rotation was used.
+
 ## Outputs & auditability
 - `FetchResult` persists text digests and metadata to JSONL, suitable for knowledge stores.
 - `FETCHER_DOWNLOAD_MODE` controls whether bodies stay inline (`text`), are mirrored to disk (`download_only`), or mirrored plus chunked into rolling windows for stream ingestion (`rolling_extract`). Rolling windows respect spaCy sentence boundaries when available (regex fallback otherwise).
 - `FetcherResult.audit` summarizes outstanding controls, applied alternates, and per-domain failures.
 - Structured keys live in `fetcher.core.keys` so integrations never stringify magic keys.
+- `outstanding_domains_summary.json` groups unresolved URLs by category, including `paywall`, `content_thin`, `link_hub`, `bot_blocked` (anti-bot interstitials), `password_protected`, `missing_file`, and `needs_login_or_playwright`.
+- Encrypted/password-protected PDFs: when `FETCHER_PDF_CRACK_ENABLE=1` and the optional `pdferli` dependency is installed, fetcher will attempt a bounded brute-force crack (charset/min/max length configurable via env) before extraction; otherwise results are marked `content_verdict="password_protected"` with empty text so downstream chunking/LLM fan-out can deterministically skip them.
 
 ## Extensibility hooks
 - Policy injection allows custom paywall hints, alternate providers, or validator tuning.

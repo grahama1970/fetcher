@@ -32,6 +32,7 @@ DEFAULT_WEIGHTS = {
     "paywall_header": 1.00,
     "noscript_paywall": 0.40,
     "meta_paywall": 0.40,
+    "paywall_domain": 0.50,
 }
 
 DEFAULT_CAPS = {
@@ -247,6 +248,7 @@ def detect_paywall(
     text, noscript_text, soup_full = _extract_text(html or "")
 
     safe_domains = _get_policy_attr(policy, "paywall_safe_domains", set()) or set()
+    safe_suffixes = tuple(_get_policy_attr(policy, "paywall_safe_suffixes", tuple()) or tuple())
     try:
         domain = urlparse(url or "").netloc.lower()
     except Exception:
@@ -257,6 +259,37 @@ def detect_paywall(
         detection["meta"]["page_text_len"] = len(text)
         detection["meta"]["article_len"] = _readability_len(html)
         return detection
+    if domain and safe_suffixes:
+        for suffix in safe_suffixes:
+            normalized_suffix = (suffix or "").strip().lower()
+            if not normalized_suffix:
+                continue
+            if normalized_suffix.startswith("."):
+                if domain.endswith(normalized_suffix):
+                    detection["indicators"]["safe_domain_suffix"] = normalized_suffix
+                    detection["verdict"] = "unlikely"
+                    detection["meta"]["page_text_len"] = len(text)
+                    detection["meta"]["article_len"] = _readability_len(html)
+                    return detection
+            else:
+                if domain == normalized_suffix or domain.endswith(f".{normalized_suffix}"):
+                    detection["indicators"]["safe_domain_suffix"] = normalized_suffix
+                    detection["verdict"] = "unlikely"
+                    detection["meta"]["page_text_len"] = len(text)
+                    detection["meta"]["article_len"] = _readability_len(html)
+                    return detection
+
+    paywall_domains = _get_policy_attr(policy, "paywall_domains", set()) or set()
+    domain_variants = {domain}
+    if domain.startswith("www."):
+        domain_variants.add(domain[4:])
+    for variant in domain_variants:
+        if variant and variant in paywall_domains:
+            weight = weights.get("paywall_domain", 0.5)
+            detection["indicators"]["paywall_domain"] = variant
+            detection["score"] += weight
+            detection["score_breakdown"]["paywall_domain"] = weight
+            break
 
     if status in (401, 403, 451):
         detection["indicators"]["unauthorized_status"] = status

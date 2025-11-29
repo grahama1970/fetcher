@@ -8,7 +8,7 @@ import os
 import re
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 
 import requests
 
@@ -64,6 +64,7 @@ DEFAULT_OVERRIDE_RULES: List[Dict[str, Any]] = [
 
 _OVERRIDE_RULES: Optional[List[Dict[str, Any]]] = None
 _PAYWALL_VERDICT_ALLOW = frozenset({"maybe", "likely"})
+_WAYBACK_API = "https://archive.org/wayback/available?url={url}&timestamp="
 
 
 def reload_overrides_cache() -> None:
@@ -104,6 +105,38 @@ def _merge_paywall_hints(policy: "FetcherPolicy") -> Tuple[str, ...]:
     except Exception:
         pass
     return policy.paywall_hints
+
+
+def _lookup_wayback_snapshot(url: str) -> Optional[Dict[str, Any]]:
+    api = _WAYBACK_API.format(url=quote(url, safe=""))
+    try:
+        resp = requests.get(api, timeout=20)
+        if not resp.ok:
+            return None
+        data = resp.json()
+    except Exception:
+        return None
+    snapshots = (data.get("archived_snapshots") or {}) if isinstance(data, dict) else {}
+    closest = snapshots.get("closest") if isinstance(snapshots, dict) else None
+    if not isinstance(closest, dict):
+        return None
+    if closest.get("available"):
+        return closest
+    return None
+
+
+def _wayback_candidate_url(original_url: str) -> Optional[Tuple[str, Dict[str, Any]]]:
+    snapshot = _lookup_wayback_snapshot(original_url)
+    if not snapshot:
+        return None
+    candidate = snapshot.get("url")
+    if not candidate:
+        timestamp = snapshot.get("timestamp")
+        if timestamp:
+            candidate = f"https://web.archive.org/web/{timestamp}/{original_url}"
+    if not candidate:
+        return None
+    return candidate, snapshot
 
 
 def _verdict_allows_resolver(result: Optional[FetchResult]) -> bool:
@@ -215,6 +248,54 @@ def _persist_alternate_updates(
     with log_path.open("a", encoding="utf-8") as fh:
         for record in applied:
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _apply_wayback_fallback(
+    pending: Dict[str, Tuple[int, Dict[str, Any]]],
+    *,
+    limit: int,
+    config: FetchConfig,
+    policy: "FetcherPolicy",
+    run_fetch_loop: Callable[[Any], Any],
+    results: List[FetchResult],
+    url_updates: Dict[str, str],
+) -> List[Dict[str, Any]]:
+    if not pending:
+        return []
+    applied: List[Dict[str, Any]] = []
+    attempts = 0
+    for original_url, (_idx, entry) in list(pending.items()):
+        if limit > 0 and attempts >= limit:
+            break
+        candidate = _wayback_candidate_url(original_url)
+        if not candidate:
+            continue
+        candidate_url, snapshot = candidate
+        validation = _validate_candidate_url(candidate_url, config, policy, run_fetch_loop)
+        if not validation:
+            continue
+        current_url = entry.get(K_URL, original_url)
+        entry.setdefault(K_ORIGINAL_URL, original_url)
+        entry[K_URL] = candidate_url
+        entry[K_DOMAIN] = urlparse(candidate_url).netloc
+        entry[K_SOURCE] = "wayback"
+
+        results[:] = [r for r in results if r.url != current_url]
+        results.append(validation)
+
+        url_updates[original_url] = candidate_url
+        applied.append(
+            {
+                "control_id": (entry.get(K_CONTROLS) or [original_url])[0],
+                "old_url": original_url,
+                "new_url": candidate_url,
+                "provider": "wayback",
+                "summary": f"archive snapshot {snapshot.get('timestamp')}" if snapshot.get("timestamp") else "archive snapshot",
+            }
+        )
+        pending.pop(original_url, None)
+        attempts += 1
+    return applied
 
 
 def _stable_rule_id(rule: Dict[str, Any]) -> str:
@@ -433,11 +514,15 @@ def resolve_paywalled_entries(
                 applied.append(record)
                 continue
 
+        content_verdict = (result.metadata or {}).get("content_verdict", "").lower() if result else ""
+        is_missing_file = content_verdict == "missing_file"
+
         is_404 = (status == 404)
-        if (status not in policy.paywall_status_codes) and not is_404:
-            continue
-        if domain not in policy.paywall_domains:
-            continue
+        if not is_missing_file:
+            if (status not in policy.paywall_status_codes) and not is_404:
+                continue
+            if domain not in policy.paywall_domains:
+                continue
         if not _verdict_allows_resolver(result):
             continue
 
@@ -483,12 +568,31 @@ def resolve_paywalled_entries(
             _persist_alternate_updates(inventory_path, run_artifacts_dir, url_updates, applied)
         return applied
 
+    # Wayback fallback (free) before any paid resolvers.
+    if pending and (limit <= 0 or len(applied) < limit):
+        wayback_limit = max(0, limit - len(applied)) if limit > 0 else 0
+        wayback_records = _apply_wayback_fallback(
+            pending,
+            limit=wayback_limit,
+            config=config,
+            policy=policy,
+            run_fetch_loop=run_fetch_loop,
+            results=results,
+            url_updates=url_updates,
+        )
+        if wayback_records:
+            applied.extend(wayback_records)
+
     if not (policy.enable_perplexity_resolver and os.getenv("PERPLEXITY_API_KEY")):
         if applied:
             _persist_alternate_updates(inventory_path, run_artifacts_dir, url_updates, applied)
         return applied
 
     remaining_targets = list(pending.items())[: max(0, limit - len(applied))]
+    if not remaining_targets:
+        if applied:
+            _persist_alternate_updates(inventory_path, run_artifacts_dir, url_updates, applied)
+        return applied
     controls: List[Any] = []
 
     for original_url, (_idx, entry) in remaining_targets:

@@ -70,7 +70,44 @@ export FETCHER_SINGLE_RUN_ARTIFACTS=run/fetcher_artifacts
 
 Sentence segmentation prefers spaCy's sentencizer when installed and falls back to a regex-based splitter otherwise.
 
-## 7. Tests + lint
+## 7. Optional PDF password cracking
+- Install helper: `uv add pdferli` (or `pip install pdferli` inside the venv).
+- Enable and tune via env:
+
+```
+export FETCHER_PDF_CRACK_ENABLE=1
+export FETCHER_PDF_CRACK_CHARSET=0123456789
+export FETCHER_PDF_CRACK_MINLEN=4
+export FETCHER_PDF_CRACK_MAXLEN=6
+export FETCHER_PDF_CRACK_TIMEOUT=15   # seconds, default 15
+export FETCHER_PDF_CRACK_PROCESSES=2  # CPU cores to use
+```
+
+When a PDF requires a password, fetcher will attempt a bounded brute-force; on success text is extracted, on failure the entry is marked `content_verdict="password_protected"` and skipped downstream.
+
+## 8. Optional IP rotation fallback (Step 06)
+
+Step 06 teams that already maintain IPRoyal credentials (see `memory/scripts/smokes/iproyal_login.py`) can let fetcher retry rate-limited domains through the proxy automatically. Configure the env before launching the run:
+
+```
+export SPARTA_STEP06_PROXY_HOST=gw.iproyal.com
+export SPARTA_STEP06_PROXY_PORT=12321
+export SPARTA_STEP06_PROXY_USER=team
+export SPARTA_STEP06_PROXY_PASSWORD=super-secret
+# Optional tuning
+export SPARTA_STEP06_PROXY_DOMAINS=d3fend.mitre.org,atlas.mitre.org
+export SPARTA_STEP06_PROXY_STATUSES=429,403
+export SPARTA_STEP06_PROXY_HINTS="rate limit,too many requests"
+```
+
+- You can pass a full URI via `SPARTA_STEP06_PROXY_URL=http://user:pass@gw.iproyal.com:12321` or `SPARTA_STEP06_PROXY_CREDENTIALS=user:pass`.
+- When the `SPARTA_STEP06_PROXY_*` vars are missing, fetcher falls back to `IPROYAL_HOST|PORT|USER|PASSWORD`, keeping the proxy smokes and Step 06 runner in sync.
+- Allowlisted domains default to `d3fend.mitre.org` (set `SPARTA_STEP06_PROXY_DOMAINS_DISABLE_DEFAULTS=1` to opt out). Hints and status codes are comma-separated lists.
+- Disable the feature at runtime with `SPARTA_STEP06_PROXY_DISABLE=1`.
+
+When a throttled response (e.g., 429) matches the allowlist, the fetcher retries through the proxy before Wayback/Jina. Each proxied `FetchResult` advertises `proxy_rotation_*` metadata, and the audit JSON includes a `proxy_rotation` section summarizing attempts, successes, and per-domain usage so Step 06 operators can trace every rotation.
+
+## 9. Tests + lint
 ```bash
 uv run pytest
 uv run ruff check src

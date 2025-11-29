@@ -64,6 +64,8 @@ PAYWALL_DOMAINS = {
     "www.raeng.org.uk",
     "smcit-scc.space",
     "waterfall-security.com",
+    "hbr.org",
+    "www.hbr.org",
 }
 
 PAYWALL_STATUS_CODES = {401, 402, 403, 404, 500, 502, 503, 202, -1}
@@ -83,6 +85,8 @@ PAYWALL_HINTS = (
 PAYWALL_SAFE_DOMAINS = {
     "attack.mitre.org",
     "d3fend.mitre.org",
+    "www.attack.mitre.org",
+    "www.d3fend.mitre.org",
     "capec.mitre.org",
     "cwe.mitre.org",
     "csrc.nist.gov",
@@ -117,6 +121,8 @@ PAYWALL_SAFE_DOMAINS = {
     "sparta.aerospace.org",
     "csis.org",
     "aerospaceamerica.org",
+    "cisa.gov",
+    "www.cisa.gov",
 }
 
 PAYWALL_SAFE_SUFFIXES = (

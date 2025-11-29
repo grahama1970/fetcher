@@ -7,7 +7,7 @@ from fetcher.workflows.download_utils import (
     apply_download_mode,
     maybe_externalize_text,
 )
-from fetcher.workflows.web_fetch import FetchResult, _select_wayback_timestamp
+from fetcher.workflows.web_fetch import FetchResult, _select_wayback_timestamp, _domain_matches_allowlist
 
 
 def test_resolve_repo_root_finds_data_dir(tmp_path: Path) -> None:
@@ -48,9 +48,16 @@ def test_maybe_externalize_text(tmp_path: Path) -> None:
     assert result.text == ""
     metadata = result.metadata or {}
     assert metadata.get("text_externalized") is True
+    assert metadata.get("text_inline_missing") is True
     text_path = metadata.get("text_path")
     assert text_path is not None
     assert Path(text_path).exists()
+    assert metadata.get("file_path") == text_path
+    assert metadata.get("text_length_chars") == 32
+
+    # Ensure FetchResult serializes original length even when inline text removed
+    payload = result.to_dict()
+    assert payload["text_length"] == 32
 
 
 def test_select_wayback_timestamp_prefers_first_column() -> None:
@@ -64,6 +71,12 @@ def test_select_wayback_timestamp_prefers_first_column() -> None:
 
 def test_select_wayback_timestamp_handles_missing_rows() -> None:
     assert _select_wayback_timestamp([["timestamp"]]) is None
+
+
+def test_domain_matches_allowlist() -> None:
+    allow = {"mitre.org"}
+    assert _domain_matches_allowlist("attack.mitre.org", allow) == "mitre.org"
+    assert _domain_matches_allowlist("example.com", allow) is None
 
 
 def test_apply_download_mode_download_only(tmp_path: Path) -> None:
@@ -87,6 +100,7 @@ def test_apply_download_mode_download_only(tmp_path: Path) -> None:
     assert metadata["download_mode"] == "download_only"
     assert result.text == ""
     assert result.raw_bytes is None
+    assert metadata.get("file_path") == str(blob_path)
 
 
 def test_apply_download_mode_rolling_extract(tmp_path: Path) -> None:
@@ -158,6 +172,44 @@ def test_detect_paywall_respects_safe_domains() -> None:
 
     assert detection["verdict"] == "unlikely"
     assert detection["indicators"].get("safe_domain") == "attack.mitre.org"
+
+
+def test_detect_paywall_respects_safe_suffixes() -> None:
+    html = """
+    <html><body><div>Account holders may subscribe for updates.</div></body></html>
+    """
+
+    class Policy:
+        paywall_safe_domains = set()
+        paywall_safe_suffixes = (".gov",)
+
+    detection = paywall_detector.detect_paywall(
+        url="https://www.cisa.gov/resources",
+        status=200,
+        html=html,
+        policy=Policy(),
+    )
+
+    assert detection["verdict"] == "unlikely"
+    assert detection["indicators"].get("safe_domain_suffix") in {".gov", "gov"}
+
+
+def test_detect_paywall_marks_known_paywall_domains() -> None:
+    html = "<html><body><div>Sample teaser only</div></body></html>"
+
+    class Policy:
+        paywall_domains = {"hbr.org"}
+        paywall_safe_domains = set()
+
+    detection = paywall_detector.detect_paywall(
+        url="https://hbr.org/1964/01/profit-from-the-learning-curve",
+        status=200,
+        html=html,
+        policy=Policy(),
+    )
+
+    assert detection["verdict"] in {"maybe", "likely"}
+    assert detection["indicators"].get("paywall_domain") == "hbr.org"
 
 
 def test_paywall_verdict_gate_respects_annotations() -> None:

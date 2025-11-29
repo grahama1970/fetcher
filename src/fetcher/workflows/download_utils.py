@@ -68,6 +68,9 @@ def maybe_externalize_text(
         metadata["text_externalized"] = True
         metadata["text_inline_bytes"] = len(text_bytes)
         metadata["text_sha256"] = sha
+        metadata["file_path"] = str(blob_path)
+        metadata["text_length_chars"] = len(text)
+        metadata["text_inline_missing"] = True
 
         result.metadata = metadata
         result.text = ""
@@ -107,6 +110,7 @@ def _persist_blob_for_result(result: FetchResult, download_dir: Path) -> Optiona
     metadata["blob_content_type"] = result.content_type
     metadata["blob_source"] = source
     metadata["blob_filename"] = blob_path.name
+    metadata.setdefault("file_path", str(blob_path))
     result.metadata = metadata
     return blob_path
 

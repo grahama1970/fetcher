@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+from asyncio.subprocess import PIPE as SUBPROCESS_PIPE
 import csv
 import hashlib
+import itertools
 import re
 import json
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import multiprocessing
+import tempfile
+import time
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Set
 from urllib.parse import unquote, urlparse, urlunparse
 
 import aiohttp
@@ -27,6 +33,8 @@ from .extract_utils import extract_content_features
 from .fetcher_utils import has_text_payload
 
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+
+logger = logging.getLogger(__name__)
 
 try:  # Optional OCR fallback for image-heavy PDFs
     import pytesseract  # type: ignore
@@ -72,6 +80,200 @@ SPA_FALLBACK_DOMAINS = {
     "www.splunk.com",
     "splunk.com",
 }
+
+
+def _pdf_crack_settings() -> Dict[str, Any]:
+    def _bool(name: str, default: str = "0") -> bool:
+        raw = os.getenv(name, default)
+        return str(raw).strip().lower() not in {"0", "false", "no", "off", ""}
+
+    def _int(name: str, default: int) -> int:
+        try:
+            return int(os.getenv(name, str(default)))
+        except Exception:
+            return default
+
+    charset = os.getenv("FETCHER_PDF_CRACK_CHARSET", "0123456789")
+    processes_default = max(1, (os.cpu_count() or 2) // 2)
+
+    return {
+        "enable": _bool("FETCHER_PDF_CRACK_ENABLE", "0"),
+        "charset": charset,
+        "minlen": _int("FETCHER_PDF_CRACK_MINLEN", 4),
+        "maxlen": _int("FETCHER_PDF_CRACK_MAXLEN", 6),
+        "processes": max(1, _int("FETCHER_PDF_CRACK_PROCESSES", processes_default)),
+        "timeout": max(1, _int("FETCHER_PDF_CRACK_TIMEOUT", 15)),
+        "verbose": _bool("FETCHER_PDF_CRACK_VERBOSE", "0"),
+        "bruteforce_limit": max(0, _int("FETCHER_PDF_BRUTE_LIMIT", 50000)),
+    }
+
+
+def _brute_force_pdf_password(
+    raw_bytes: bytes,
+    charset: str,
+    minlen: int,
+    maxlen: int,
+    limit: int,
+) -> Tuple[Optional[str], Dict[str, Any]]:
+    meta: Dict[str, Any] = {
+        "pdf_password_bruteforce_attempted": True,
+        "pdf_password_bruteforce_limit": limit,
+    }
+    if limit <= 0:
+        meta["pdf_password_bruteforce_skipped"] = "disabled"
+        return None, meta
+    if fitz is None:
+        meta["pdf_password_bruteforce_error"] = "pymupdf_missing"
+        return None, meta
+    charset = "".join(dict.fromkeys(charset))
+    if not charset:
+        meta["pdf_password_bruteforce_error"] = "empty_charset"
+        return None, meta
+
+    total_space = 0
+    for length in range(max(1, minlen), max(minlen, maxlen) + 1):
+        try:
+            total_space += len(charset) ** length
+        except OverflowError:
+            total_space = limit + 1
+            break
+    meta["pdf_password_bruteforce_space"] = total_space
+    if limit > 0 and total_space > limit:
+        meta["pdf_password_bruteforce_skipped"] = "limit_exceeded"
+        return None, meta
+
+    try:
+        doc = fitz.open(stream=raw_bytes, filetype="pdf")
+    except Exception as exc:
+        meta["pdf_password_bruteforce_error"] = f"open_failed:{exc}"
+        return None, meta
+
+    attempts = 0
+    try:
+        for length in range(max(1, minlen), max(minlen, maxlen) + 1):
+            for combo in itertools.product(charset, repeat=length):
+                attempts += 1
+                candidate = "".join(combo)
+                try:
+                    if doc.authenticate(candidate):
+                        meta["pdf_password_bruteforce_attempts"] = attempts
+                        return candidate, meta
+                except Exception:
+                    continue
+    finally:
+        doc.close()
+    meta["pdf_password_bruteforce_attempts"] = attempts
+    meta["pdf_password_bruteforce_failed"] = True
+    return None, meta
+
+
+def _crack_pdf_password(raw_bytes: bytes, url: str) -> Tuple[Optional[str], Dict[str, Any]]:
+    """Attempt to crack a password-protected PDF using pdferli.
+
+    Returns (password | None, metadata). Metadata may include timeout/error flags.
+    This is best-effort and bounded by FETCHER_PDF_CRACK_TIMEOUT seconds.
+    """
+
+    settings = _pdf_crack_settings()
+    meta: Dict[str, Any] = {
+        "pdf_password_crack_enabled": bool(settings.get("enable")),
+        "pdf_password_charset": settings.get("charset"),
+        "pdf_password_minlen": settings.get("minlen"),
+        "pdf_password_maxlen": settings.get("maxlen"),
+        "pdf_password_processes": settings.get("processes"),
+    }
+
+    if not settings.get("enable"):
+        meta["pdf_password_crack_skipped"] = "disabled"
+        return None, meta
+
+    try:
+        from pdferli import crack_password  # type: ignore
+    except Exception as exc:  # pragma: no cover - optional dependency
+        meta["pdf_password_crack_error"] = f"pdferli_unavailable: {exc}"
+        return None, meta
+
+    charset = str(settings.get("charset") or "")
+    if not charset:
+        meta["pdf_password_crack_error"] = "empty_charset"
+        return None, meta
+
+    timeout = int(settings.get("timeout", 15))
+    minlen = int(settings.get("minlen", 1))
+    maxlen = int(settings.get("maxlen", minlen))
+    processes = int(settings.get("processes", 1))
+    verbose = bool(settings.get("verbose"))
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(raw_bytes)
+        tmp_path = tmp.name
+
+    def _worker(path: str, queue: multiprocessing.Queue) -> None:
+        try:
+            pwd = crack_password(
+                file=path,
+                chars=charset,
+                minlen=minlen,
+                maxlen=maxlen,
+                processes=processes,
+                verbose=verbose,
+            )
+            queue.put({"password": pwd})
+        except Exception as exc:  # pragma: no cover - runtime failure
+            queue.put({"error": str(exc)})
+
+    queue: multiprocessing.Queue = multiprocessing.Queue()
+    start = time.perf_counter()
+    proc = multiprocessing.Process(target=_worker, args=(tmp_path, queue))
+    proc.start()
+    proc.join(timeout)
+    if proc.is_alive():
+        proc.terminate()
+        proc.join()
+        meta["pdf_password_crack_timeout"] = True
+        meta["pdf_password_crack_ms"] = int((time.perf_counter() - start) * 1000)
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        return None, meta
+
+    result = queue.get() if not queue.empty() else {}
+    meta["pdf_password_crack_ms"] = int((time.perf_counter() - start) * 1000)
+
+    try:
+        os.remove(tmp_path)
+    except Exception:
+        pass
+
+    if "error" in result:
+        meta["pdf_password_crack_error"] = result.get("error")
+        return None, meta
+
+    password = result.get("password")
+    if not password:
+        limit = int(settings.get("bruteforce_limit", 0))
+        fallback_password: Optional[str] = None
+        fallback_meta: Dict[str, Any] = {}
+        if limit != 0:
+            fallback_password, fallback_meta = _brute_force_pdf_password(
+                raw_bytes,
+                charset,
+                minlen,
+                maxlen,
+                limit,
+            )
+            meta.update(fallback_meta)
+        if fallback_password:
+            password = fallback_password
+        else:
+            meta["pdf_password_crack_failed"] = True
+            return None, meta
+
+    meta["pdf_password_recovered"] = True
+    meta["pdf_password_length"] = len(str(password))
+    meta["pdf_password_charset_used"] = settings.get("charset")
+    return str(password), meta
 
 SIGNIN_MODAL_DOMAINS = {
     "www.linkedin.com",
@@ -137,6 +339,236 @@ def _toggle_trailing_slash(u: str) -> str:
         return u
 
 
+def _split_env_list(value: str, *, lower: bool = False) -> Tuple[str, ...]:
+    tokens: List[str] = []
+    for token in value.split(","):
+        cleaned = token.strip()
+        if not cleaned:
+            continue
+        tokens.append(cleaned.lower() if lower else cleaned)
+    # Preserve order but drop duplicates
+    seen: Set[str] = set()
+    ordered: List[str] = []
+    for token in tokens:
+        if token in seen:
+            continue
+        seen.add(token)
+        ordered.append(token)
+    return tuple(ordered)
+
+
+def _env_int_list(raw: str) -> Tuple[int, ...]:
+    values: List[int] = []
+    for token in raw.split(","):
+        cleaned = token.strip()
+        if not cleaned:
+            continue
+        try:
+            values.append(int(cleaned))
+        except ValueError:
+            continue
+    # Preserve order but dedupe
+    deduped: List[int] = []
+    seen: Set[int] = set()
+    for val in values:
+        if val in seen:
+            continue
+        seen.add(val)
+        deduped.append(val)
+    return tuple(deduped)
+
+
+def _as_bool(value: Optional[str], default: bool = False) -> bool:
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if not normalized:
+        return default
+    return normalized not in {"0", "false", "off", "no"}
+
+
+def _safe_int(value: Optional[str], default: Optional[int] = None) -> Optional[int]:
+    if value is None:
+        return default
+    try:
+        cleaned = value.strip()
+        if not cleaned:
+            return default
+        return int(cleaned)
+    except Exception:
+        return default
+
+
+def _detect_proxy_credit_exhaustion(status: int, text: Optional[str], error: Optional[str]) -> Optional[str]:
+    haystacks: List[str] = []
+    if text:
+        haystacks.append(text)
+    if error:
+        haystacks.append(error)
+    for blob in haystacks:
+        lower = blob.lower()
+        for keyword in PROXY_CREDIT_KEYWORDS:
+            if keyword in lower:
+                return keyword
+    if status in PROXY_CREDIT_STATUS_HINTS:
+        return f"status_{status}"
+    return None
+
+
+DEFAULT_PROXY_DOMAINS = ("d3fend.mitre.org",)
+DEFAULT_PROXY_STATUSES = (429,)
+DEFAULT_PROXY_HINTS = (
+    "rate limit",
+    "too many requests",
+    "temporarily blocked",
+    "retry later",
+    "exceeded your request quota",
+    "too many hits",
+)
+
+PROXY_CREDIT_STATUS_HINTS = {402, 407, 509, 511}
+PROXY_CREDIT_KEYWORDS = (
+    "out of credit",
+    "out-of-credit",
+    "out of credits",
+    "no credit",
+    "insufficient credit",
+    "insufficient credits",
+    "insufficient balance",
+    "insufficient traffic",
+    "traffic exhausted",
+    "bandwidth exhausted",
+    "bandwidth limit exceeded",
+    "not enough credit",
+    "exhausted your traffic",
+)
+
+
+@dataclass(frozen=True)
+class ProxyRotationSettings:
+    scheme: str
+    host: str
+    port: int
+    username: Optional[str]
+    password: Optional[str]
+    provider: str
+    allowed_domains: Tuple[str, ...] = ()
+    trigger_statuses: Tuple[int, ...] = DEFAULT_PROXY_STATUSES
+    trigger_hints: Tuple[str, ...] = DEFAULT_PROXY_HINTS
+
+    @property
+    def proxy_url(self) -> str:
+        return f"{self.scheme}://{self.host}:{self.port}"
+
+    @property
+    def display_endpoint(self) -> str:
+        return f"{self.host}:{self.port}"
+
+    def allows_domain(self, domain: str) -> bool:
+        if not self.allowed_domains:
+            return True
+        domain = domain.lower()
+        for token in self.allowed_domains:
+            token = token.strip().lstrip(".")
+            if not token:
+                continue
+            if token == "*":
+                return True
+            if domain == token or domain.endswith(f".{token}"):
+                return True
+        return False
+
+    def should_proxy(self, domain: str, status: int, text: Optional[str]) -> Optional[str]:
+        if not self.allows_domain(domain):
+            return None
+        if self.trigger_statuses and status in self.trigger_statuses:
+            return f"status_{status}"
+        if text:
+            lower_text = text.lower()
+            for hint in self.trigger_hints:
+                token = hint.strip().lower()
+                if not token:
+                    continue
+                if token in lower_text:
+                    return f"hint_{token}"
+        return None
+
+
+def _load_proxy_rotation_from_env() -> Optional[ProxyRotationSettings]:
+    if _as_bool(os.getenv("SPARTA_STEP06_PROXY_DISABLE"), False):
+        return None
+
+    raw_url = os.getenv("SPARTA_STEP06_PROXY_URL", "").strip()
+    scheme = "http"
+    host = ""
+    port: Optional[int] = None
+    username: Optional[str] = None
+    password: Optional[str] = None
+
+    if raw_url:
+        parsed = urlparse(raw_url if "://" in raw_url else f"http://{raw_url}")
+        scheme = parsed.scheme or scheme
+        host = parsed.hostname or host
+        port = parsed.port or port
+        if parsed.username:
+            username = parsed.username
+        if parsed.password:
+            password = parsed.password
+
+    host = host or os.getenv("SPARTA_STEP06_PROXY_HOST", os.getenv("IPROYAL_HOST", "")).strip()
+    port = port or _safe_int(os.getenv("SPARTA_STEP06_PROXY_PORT", os.getenv("IPROYAL_PORT", "")))
+
+    creds = os.getenv("SPARTA_STEP06_PROXY_CREDENTIALS", "").strip()
+    if creds and (":" in creds) and (not username or not password):
+        user_part, _, pwd_part = creds.partition(":")
+        username = username or user_part
+        password = password or pwd_part
+
+    username = username or os.getenv(
+        "SPARTA_STEP06_PROXY_USER",
+        os.getenv("SPARTA_STEP06_PROXY_USERNAME", os.getenv("IPROYAL_USER", "")),
+    ).strip()
+    password = password or os.getenv(
+        "SPARTA_STEP06_PROXY_PASSWORD",
+        os.getenv("SPARTA_STEP06_PROXY_PASS", os.getenv("IPROYAL_PASSWORD", os.getenv("IPROYAL_PASS", ""))),
+    ).strip()
+
+    provider = os.getenv("SPARTA_STEP06_PROXY_PROVIDER", "iproyal").strip() or "iproyal"
+    domain_tokens = _split_env_list(os.getenv("SPARTA_STEP06_PROXY_DOMAINS", ""), lower=True)
+    if not domain_tokens and not _as_bool(os.getenv("SPARTA_STEP06_PROXY_DOMAINS_DISABLE_DEFAULTS")):
+        domain_tokens = DEFAULT_PROXY_DOMAINS
+    status_tokens = _env_int_list(os.getenv("SPARTA_STEP06_PROXY_STATUSES", ""))
+    if not status_tokens:
+        status_tokens = DEFAULT_PROXY_STATUSES
+    hint_tokens = _split_env_list(os.getenv("SPARTA_STEP06_PROXY_HINTS", ""), lower=True)
+    if not hint_tokens:
+        hint_tokens = DEFAULT_PROXY_HINTS
+
+    if not host or port is None:
+        return None
+
+    username = username or None
+    password = password or None
+
+    return ProxyRotationSettings(
+        scheme=scheme or "http",
+        host=host,
+        port=int(port),
+        username=username,
+        password=password,
+        provider=provider,
+        allowed_domains=domain_tokens,
+        trigger_statuses=status_tokens,
+        trigger_hints=hint_tokens,
+    )
+
+
+def _is_iproyal_provider(settings: Optional[ProxyRotationSettings]) -> bool:
+    if settings is None:
+        return False
+    return settings.provider.lower().startswith("iproyal")
+
+
 @dataclass
 class FetchConfig:
     """Configuration parameters for asynchronous URL fetching."""
@@ -158,6 +590,7 @@ class FetchConfig:
     insecure_ssl_domains: Tuple[str, ...] = ()
     local_data_root: Optional[Path] = None
     screenshots_dir: Optional[Path] = None
+    proxy_rotation: Optional[ProxyRotationSettings] = None
 
 
 @dataclass
@@ -177,6 +610,13 @@ class FetchResult:
     raw_bytes: Optional[bytes] = field(default=None, repr=False, compare=False)
 
     def to_dict(self) -> Dict[str, Any]:
+        text_length = len(self.text)
+        metadata = self.metadata or {}
+        if text_length == 0:
+            try:
+                text_length = int(metadata.get("text_length_chars", 0))
+            except Exception:
+                text_length = 0
         payload = {
             "url": self.url,
             "domain": self.domain,
@@ -185,7 +625,7 @@ class FetchResult:
             "text_sha256": hashlib.sha256(self.text.encode("utf-8")).hexdigest()
             if self.text
             else "",
-            "text_length": len(self.text),
+            "text_length": text_length,
             "fetched_at": self.fetched_at,
             "method": self.method,
             "from_cache": self.from_cache,
@@ -228,12 +668,15 @@ class URLFetcher:
         )
         self._d3fend_cache: Dict[str, Dict[str, Dict[str, str]]] = {}
         self._insecure_ssl_domains = {domain.lower() for domain in config.insecure_ssl_domains}
+        self._proxy_rotation: Optional[ProxyRotationSettings] = config.proxy_rotation or _load_proxy_rotation_from_env()
+        self._proxy_audit: Optional[Dict[str, Any]] = None
 
     async def fetch_many(
         self,
         entries: Iterable[Dict[str, Any]],
         progress_hook: Optional[Callable[[int, int, Dict[str, Any], FetchResult], None]] = None,
     ) -> Tuple[List[FetchResult], Dict[str, Any]]:
+        self._proxy_audit = self._init_proxy_audit()
         # Deduplicate by normalized URL so variants (trailing slash, default ports) do not refetch
         # Merge metadata across duplicates (union of controls/titles/frameworks/worksheets/instances)
         dedup: Dict[str, Dict[str, Any]] = {}
@@ -312,6 +755,7 @@ class URLFetcher:
                     toc_drop_reasons: Dict[str, int] = {}
                     toc_children_kept = 0
                     toc_children_dropped = 0
+                    domain_allowances = _load_domain_allowlist()
                     for r in results:
                         meta = r.metadata or {}
                         if not meta or not meta.get("link_hub"):
@@ -327,14 +771,26 @@ class URLFetcher:
                         # Optional path allowlist (domain-specific)
                         allowlist_map = _load_path_allowlist()
                         base_host = urlparse(r.url).hostname or ""
-                        allowed_prefixes = allowlist_map.get(base_host.lower()) or []
+                        base_host_lower = base_host.lower()
+                        allowed_prefixes = allowlist_map.get(base_host_lower) or []
+                        domain_allow = _domain_matches_allowlist(base_host_lower, domain_allowances)
                         for link in links:
                             norm = _normalize_url(link)
                             if not norm or norm in existing:
                                 continue
+                            parsed_link = urlparse(norm)
+                            link_host = (parsed_link.hostname or "").lower()
+                            if link_host and link_host not in {base_host_lower} and domain_allow:
+                                if not _domain_matches_allowlist(link_host, {domain_allow}):
+                                    toc_children_dropped += 1
+                                    reason = "domain_not_allowed"
+                                    toc_drop_reasons[reason] = toc_drop_reasons.get(reason, 0) + 1
+                                    if len(toc_drop_examples) < 8:
+                                        toc_drop_examples.append({"url": norm, "reason": reason})
+                                    continue
                             # Apply allowlist when configured for this domain
                             if allowed_prefixes:
-                                p = urlparse(norm).path or "/"
+                                p = parsed_link.path or "/"
                                 if not any(p.startswith(pref) for pref in allowed_prefixes):
                                     toc_children_dropped += 1
                                     reason = "path_not_allowed"
@@ -342,6 +798,22 @@ class URLFetcher:
                                     if len(toc_drop_examples) < 8:
                                         toc_drop_examples.append({"url": norm, "reason": reason})
                                     continue
+                            elif domain_allow:
+                                if not link_host or not _domain_matches_allowlist(link_host, {domain_allow}):
+                                    toc_children_dropped += 1
+                                    reason = "domain_not_allowed"
+                                    toc_drop_reasons[reason] = toc_drop_reasons.get(reason, 0) + 1
+                                    if len(toc_drop_examples) < 8:
+                                        toc_drop_examples.append({"url": norm, "reason": reason})
+                                    continue
+                            else:
+                                # No allowlist and domain not approved; skip
+                                toc_children_dropped += 1
+                                reason = "no_allowlist"
+                                toc_drop_reasons[reason] = toc_drop_reasons.get(reason, 0) + 1
+                                if len(toc_drop_examples) < 8:
+                                    toc_drop_examples.append({"url": norm, "reason": reason})
+                                continue
                             entry = {"url": norm, **inherited}
                             fanout_entries.append(entry)
                             existing.add(norm)
@@ -402,6 +874,10 @@ class URLFetcher:
             await self._flush_cache_to_disk()
 
         extra = getattr(self, "_last_fanout_stats", None)
+        if self._proxy_audit is not None:
+            if extra is None:
+                extra = {}
+            extra["proxy_rotation"] = self._proxy_audit
         audit = self._build_audit(results, len(unique_entries), extra=extra)
         return results, audit
 
@@ -565,6 +1041,21 @@ class URLFetcher:
                                 extra_metadata = {**extra_metadata, **extra_meta2, "trailing_slash_fallback": True, "url_variant_used": alt}
                         except Exception:
                             pass
+                proxy_reason = self._should_use_proxy(domain, status, text)
+                if proxy_reason:
+                    proxy_fetch, proxy_meta = await self._fetch_with_proxy(
+                        session,
+                        url_norm,
+                        domain,
+                        proxy_reason,
+                    )
+                    extra_metadata = {**extra_metadata, **proxy_meta}
+                    if proxy_fetch is not None:
+                        status, content_type, text, method, proxy_extra_metadata, proxy_bytes = proxy_fetch
+                        raw_bytes = proxy_bytes
+                        extra_metadata = {**extra_metadata, **proxy_extra_metadata}
+                    else:
+                        extra_metadata.setdefault("proxy_rotation_failed", True)
                 if status == 200 and text:
                     self._cache[url_norm] = {
                         "status": status,
@@ -668,12 +1159,21 @@ class URLFetcher:
         url: str,
         domain: str,
         extra_headers: Optional[Dict[str, str]] = None,
+        proxy_settings: Optional[ProxyRotationSettings] = None,
+        proxy_reason: Optional[str] = None,
     ) -> Tuple[int, str, str, str, Dict[str, Any], Optional[bytes]]:
         delay = self.config.backoff_initial
         last_exc: Optional[Exception] = None
         for attempt in range(1, self.config.max_attempts + 1):
             try:
-                return await self._fetch_once(session, url, domain, extra_headers=extra_headers)
+                return await self._fetch_once(
+                    session,
+                    url,
+                    domain,
+                    extra_headers=extra_headers,
+                    proxy_settings=proxy_settings,
+                    proxy_reason=proxy_reason,
+                )
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 last_exc = exc
                 if attempt == self.config.max_attempts:
@@ -684,23 +1184,166 @@ class URLFetcher:
             raise last_exc
         raise RuntimeError("unexpected retry state")
 
+    def _init_proxy_audit(self) -> Optional[Dict[str, Any]]:
+        if not self._proxy_rotation:
+            return None
+        return {
+            "enabled": True,
+            "provider": self._proxy_rotation.provider,
+            "endpoint": self._proxy_rotation.display_endpoint,
+            "attempted": 0,
+            "success": 0,
+            "failed": 0,
+            "domains": {},
+            "reasons": {},
+            "status_counts": {},
+        }
+
+    def _proxy_audit_attempt(self, domain: str, reason: str) -> None:
+        if self._proxy_audit is None:
+            return
+        self._proxy_audit["attempted"] = int(self._proxy_audit.get("attempted", 0)) + 1
+        domains = self._proxy_audit.setdefault("domains", {})
+        domains[domain] = int(domains.get(domain, 0)) + 1
+        reasons = self._proxy_audit.setdefault("reasons", {})
+        reasons[reason] = int(reasons.get(reason, 0)) + 1
+
+    def _proxy_audit_result(self, status: int, *, success: bool) -> None:
+        if self._proxy_audit is None:
+            return
+        key = "success" if success else "failed"
+        self._proxy_audit[key] = int(self._proxy_audit.get(key, 0)) + 1
+        counts = self._proxy_audit.setdefault("status_counts", {})
+        counts[str(status)] = int(counts.get(str(status), 0)) + 1
+
+    def _proxy_audit_error(self, domain: str, reason: str, url: str, error: str) -> None:
+        if self._proxy_audit is None:
+            return
+        self._proxy_audit["failed"] = int(self._proxy_audit.get("failed", 0)) + 1
+        errors = self._proxy_audit.setdefault("errors", [])
+        errors.append({
+            "domain": domain,
+            "reason": reason,
+            "url": url,
+            "error": error,
+        })
+
+    def _proxy_audit_credit(self, domain: str, url: str, trigger: str, detail: str, status: Optional[int] = None) -> None:
+        if self._proxy_audit is None:
+            return
+        self._proxy_audit["credit_exhausted"] = int(self._proxy_audit.get("credit_exhausted", 0)) + 1
+        events = self._proxy_audit.setdefault("credit_events", [])
+        if len(events) < 20:
+            events.append({
+                "domain": domain,
+                "url": url,
+                "trigger": trigger,
+                "detail": detail,
+                "status": status,
+            })
+
+    def _flag_proxy_credit_exhaustion(
+        self,
+        metadata: Dict[str, Any],
+        domain: str,
+        url: str,
+        trigger_reason: str,
+        detail: str,
+        status: Optional[int],
+    ) -> None:
+        metadata["proxy_rotation_credit_exhausted"] = True
+        metadata["proxy_rotation_credit_reason"] = detail
+        metadata.setdefault("proxy_rotation_error", "proxy_credit_exhausted")
+        if status is not None:
+            metadata["proxy_rotation_credit_status"] = status
+        self._proxy_audit_credit(domain, url, trigger_reason, detail, status)
+        logger.warning(
+            "Proxy rotation credits exhausted via %s for %s (%s): %s",
+            (self._proxy_rotation.provider if self._proxy_rotation else "proxy"),
+            domain,
+            url,
+            detail,
+        )
+
+    def _should_use_proxy(self, domain: str, status: int, text: Optional[str]) -> Optional[str]:
+        if not self._proxy_rotation:
+            return None
+        return self._proxy_rotation.should_proxy(domain, status, text)
+
+    async def _fetch_with_proxy(
+        self,
+        session: aiohttp.ClientSession,
+        url: str,
+        domain: str,
+        reason: str,
+        extra_headers: Optional[Dict[str, str]] = None,
+    ) -> Tuple[Optional[Tuple[int, str, str, str, Dict[str, Any], Optional[bytes]]], Dict[str, Any]]:
+        settings = self._proxy_rotation
+        metadata: Dict[str, Any] = {
+            "proxy_rotation_attempted": True,
+            "proxy_rotation_reason": reason,
+            "proxy_rotation_provider": settings.provider if settings else None,
+            "proxy_rotation_endpoint": settings.display_endpoint if settings else None,
+        }
+        if not settings:
+            metadata["proxy_rotation_error"] = "proxy_disabled"
+            return None, metadata
+        self._proxy_audit_attempt(domain, reason)
+        try:
+            result = await self._fetch_with_retries(
+                session,
+                url,
+                domain,
+                extra_headers=extra_headers,
+                proxy_settings=settings,
+                proxy_reason=reason,
+            )
+        except Exception as exc:  # pragma: no cover - runtime-specific failures
+            error_message = str(exc)
+            metadata["proxy_rotation_error"] = error_message
+            if _is_iproyal_provider(settings):
+                credit_detail = _detect_proxy_credit_exhaustion(-1, None, error_message)
+                if credit_detail:
+                    self._flag_proxy_credit_exhaustion(metadata, domain, url, reason, credit_detail, None)
+            self._proxy_audit_error(domain, reason, url, error_message)
+            return None, metadata
+        status = result[0]
+        success = status == 200
+        self._proxy_audit_result(status, success=success)
+        if _is_iproyal_provider(settings):
+            credit_detail = _detect_proxy_credit_exhaustion(status, result[2], None)
+            if credit_detail:
+                self._flag_proxy_credit_exhaustion(metadata, domain, url, reason, credit_detail, status)
+        return result, metadata
+
     async def _fetch_once(
         self,
         session: aiohttp.ClientSession,
         url: str,
         domain: str,
         extra_headers: Optional[Dict[str, str]] = None,
+        proxy_settings: Optional[ProxyRotationSettings] = None,
+        proxy_reason: Optional[str] = None,
     ) -> Tuple[int, str, str, str, Dict[str, Any], Optional[bytes]]:
         try:
             ssl_context = None
             if domain in self._insecure_ssl_domains:
                 ssl_context = False  # type: ignore[assignment]
             request_headers = extra_headers or None
+            request_kwargs: Dict[str, Any] = {}
+            if proxy_settings is not None:
+                request_kwargs["proxy"] = proxy_settings.proxy_url
+                if proxy_settings.username or proxy_settings.password:
+                    request_kwargs["proxy_auth"] = aiohttp.BasicAuth(
+                        proxy_settings.username or "",
+                        proxy_settings.password or "",
+                    )
             async with session.get(
                 url,
                 timeout=self.config.timeout,
                 ssl=ssl_context,
                 headers=request_headers,
+                **request_kwargs,
             ) as resp:
                 status = resp.status
                 content_type = resp.headers.get("Content-Type", "text/html").split(";")[0]
@@ -713,16 +1356,50 @@ class URLFetcher:
         extra_metadata: Dict[str, Any] = {}
         if self._insecure_ssl_domains and domain in self._insecure_ssl_domains:
             extra_metadata["ssl_verification"] = False
+        if proxy_settings is not None:
+            extra_metadata["proxy_rotation_used"] = True
+            extra_metadata["proxy_rotation_reason"] = proxy_reason
+            extra_metadata["proxy_rotation_provider"] = proxy_settings.provider
+            extra_metadata["proxy_rotation_endpoint"] = proxy_settings.display_endpoint
         text = ""
         body_bytes: Optional[bytes] = raw_bytes
 
         is_pdf = "pdf" in content_type.lower() or url.lower().endswith(".pdf")
-
-        if is_pdf and raw_bytes:
-            method = "pdf"
-            text, pdf_meta = self._extract_pdf_text(raw_bytes, url)
-            extra_metadata.update(pdf_meta)
-            return 200, "application/pdf", text, method, extra_metadata, raw_bytes
+        pdf_parse_failed = False
+        if is_pdf:
+            pdf_bytes: Optional[bytes] = None
+            if (
+                status == 200
+                and raw_bytes
+                and ("pdf" in content_type.lower() or raw_bytes.startswith(b"%PDF"))
+            ):
+                pdf_bytes = raw_bytes
+            else:
+                fallback = await self._fetch_pdf_via_wget(url)
+                if fallback is not None:
+                    pdf_bytes, wget_meta = fallback
+                    extra_metadata.update(wget_meta)
+                    status = 200
+                    method = "wget"
+            if pdf_bytes:
+                method = method if method == "wget" else "pdf"
+                try:
+                    text, pdf_meta = self._extract_pdf_text(pdf_bytes, url)
+                    extra_metadata.update(pdf_meta)
+                    return 200, "application/pdf", text, method, extra_metadata, pdf_bytes
+                except RuntimeError as exc:
+                    extra_metadata["pdf_parse_error"] = str(exc)
+                    pdf_parse_failed = True
+                    status = 404
+                    text = ""
+                    body_bytes = None
+                    method = "error"
+            else:
+                pdf_parse_failed = True
+                status = 404
+                text = ""
+                body_bytes = None
+                method = "error"
 
         if "zstd" in encoding:
             import zstandard as zstd  # type: ignore
@@ -744,10 +1421,23 @@ class URLFetcher:
         if status == 200 and not is_pdf:
             needs_playwright = domain_requires_spa or self._needs_playwright(url, text, content_type, domain)
             if needs_playwright and fallback_allowed:
-                status, content_type, text, pw_meta, pw_bytes = await self._fetch_with_playwright(url, status)
-                method = "playwright"
-                extra_metadata.update(pw_meta)
-                body_bytes = pw_bytes
+                original_text = text
+                original_bytes = body_bytes
+                try:
+                    status, content_type, text, pw_meta, pw_bytes = await self._fetch_with_playwright(url, status)
+                    method = "playwright"
+                    extra_metadata.update(pw_meta)
+                    if text:
+                        body_bytes = pw_bytes
+                    else:
+                        text = original_text
+                        body_bytes = original_bytes
+                        extra_metadata.setdefault("playwright_failed", True)
+                except Exception as exc:  # pragma: no cover - runtime fallback
+                    text = original_text
+                    body_bytes = original_bytes
+                    extra_metadata.setdefault("playwright_failed", True)
+                    extra_metadata.setdefault("playwright_error", str(exc))
             # After we have final HTML text, analyze for link-hub/ToC pages
             try:
                 hub_meta = self._analyze_link_hub(text or "", url)
@@ -755,22 +1445,34 @@ class URLFetcher:
                     extra_metadata.update(hub_meta)
             except Exception:
                 pass
-        elif fallback_allowed and (domain_requires_spa or status in fallback_statuses):
-            status_playwright, content_type_playwright, text_playwright, pw_meta, pw_bytes = await self._fetch_with_playwright(url, status)
-            if text_playwright:
-                status = status_playwright or status
-                content_type = content_type_playwright
-                text = text_playwright
-                method = "playwright"
-                extra_metadata.update(pw_meta)
-                body_bytes = pw_bytes
-                # Analyze link-hub characteristics for the Playwright-rendered HTML
-                try:
-                    hub_meta = self._analyze_link_hub(text or "", url)
-                    if hub_meta:
-                        extra_metadata.update(hub_meta)
-                except Exception:
-                    pass
+        elif fallback_allowed and not is_pdf and (domain_requires_spa or status in fallback_statuses):
+            original_text = text
+            original_bytes = body_bytes
+            try:
+                status_playwright, content_type_playwright, text_playwright, pw_meta, pw_bytes = await self._fetch_with_playwright(url, status)
+                if text_playwright:
+                    status = status_playwright or status
+                    content_type = content_type_playwright
+                    text = text_playwright
+                    method = "playwright"
+                    extra_metadata.update(pw_meta)
+                    body_bytes = pw_bytes
+                    # Analyze link-hub characteristics for the Playwright-rendered HTML
+                    try:
+                        hub_meta = self._analyze_link_hub(text or "", url)
+                        if hub_meta:
+                            extra_metadata.update(hub_meta)
+                    except Exception:
+                        pass
+                else:
+                    text = original_text
+                    body_bytes = original_bytes
+                    extra_metadata.setdefault("playwright_failed", True)
+            except Exception as exc:  # pragma: no cover - runtime fallback
+                text = original_text
+                body_bytes = original_bytes
+                extra_metadata.setdefault("playwright_failed", True)
+                extra_metadata.setdefault("playwright_error", str(exc))
 
         # Certain providers (e.g., Cloudflare) return 200 with a block page.
         block_tokens = ("cf-error-details", "you are unable to access", "you have been blocked")
@@ -795,6 +1497,14 @@ class URLFetcher:
                     extra_metadata.update(wb_meta)
                     body_bytes = wb_bytes
 
+        # Optional Google Translate fallback for stubborn bot/interstitial 403/503 pages.
+        if status in {403, 503} and os.getenv("FETCHER_ENABLE_GOOGLE_TRANSLATE", "0") == "1":
+            gt = await self._fetch_from_google_translate(session, url)
+            if gt is not None:
+                status, content_type, text, method, gt_meta, gt_bytes = gt
+                extra_metadata.update(gt_meta)
+                body_bytes = gt_bytes
+
         if status in {404, 410, -1}:
             brave_hint = self._brave_lookup(url)
             if brave_hint:
@@ -811,6 +1521,27 @@ class URLFetcher:
                     body_bytes = alt_bytes
 
         return status, content_type, text, method, extra_metadata, body_bytes
+
+    async def _fetch_pdf_via_wget(self, url: str) -> Optional[Tuple[bytes, Dict[str, Any]]]:
+        cmd = ["wget", "-q", "-O", "-", url]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=SUBPROCESS_PIPE,
+                stderr=SUBPROCESS_PIPE,
+            )
+        except FileNotFoundError:
+            return None
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0 or not stdout:
+            return None
+        metadata = {
+            "wget_fallback": True,
+            "wget_command": " ".join(cmd),
+        }
+        if stderr:
+            metadata["wget_stderr"] = stderr.decode("utf-8", "ignore")[:500]
+        return stdout, metadata
 
     def _brave_lookup(self, url: str) -> Optional[str]:
         api_key = os.getenv("BRAVE_API_KEY")
@@ -946,6 +1677,38 @@ class URLFetcher:
             "jina_url": jina_url,
         }
         return 200, "text/html", text, "jina", metadata, body
+
+    async def _fetch_from_google_translate(
+        self,
+        session: aiohttp.ClientSession,
+        url: str,
+    ) -> Optional[Tuple[int, str, str, str, Dict[str, Any], Optional[bytes]]]:
+        """Fallback via Google Translate wrapper (optional, flag gated).
+
+        This is best-effort and only used when explicitly enabled, to avoid
+        surprising traffic patterns by default.
+        """
+
+        wrapper = (
+            "https://translate.google.com/translate?"
+            f"sl=auto&tl=en&u={quote(url, safe='')}"
+        )
+        try:
+            async with session.get(wrapper, timeout=self.config.timeout) as resp:
+                if resp.status != 200:
+                    return None
+                body = await resp.read()
+        except Exception:
+            return None
+
+        text = body.decode("utf-8", "ignore") if body else ""
+        if not text.strip():
+            return None
+        metadata = {
+            "via": "google_translate",
+            "google_translate_url": wrapper,
+        }
+        return 200, "text/html", text, "google_translate", metadata, body
 
     def _analyze_link_hub(self, html: str, base_url: str) -> Dict[str, Any]:
         """Detect link-heavy ToC/portal pages and harvest outlinks (bounded).
@@ -1179,18 +1942,58 @@ class URLFetcher:
     async def _fetch_with_playwright(self, url: str, origin_status: Optional[int] = None) -> Tuple[int, str, str, Dict[str, Any], bytes]:
         assert async_playwright is not None  # For type checker
         async with async_playwright() as p:  # type: ignore
-            browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context(user_agent=self.config.user_agent)
+            headed = os.getenv("FETCHER_PLAYWRIGHT_HEADED", "0") == "1"
+            headed_domains_env = os.getenv("FETCHER_PLAYWRIGHT_HEADED_DOMAINS", "")
+            headed_domains = {
+                d.strip().lower()
+                for d in headed_domains_env.split(",")
+                if d.strip()
+            }
+            domain = urlparse(url).netloc.lower()
+            if domain in headed_domains:
+                headed = True
+            browser = await p.chromium.launch(headless=not headed)
+            # Align context with a typical desktop browser profile. This reduces
+            # false-positive bot detection without attempting to evade provider
+            # controls.
+            context = await browser.new_context(
+                user_agent=self.config.user_agent,
+                viewport={"width": 1920, "height": 1080},
+                locale="en-US",
+                java_script_enabled=True,
+            )
             page = await context.new_page()
             dismissed_modal = False
             screenshot_path: Optional[Path] = None
+            interstitial_seen = False
             try:
                 response = await page.goto(
                     url,
                     timeout=int(self.config.timeout * 1000),
                     wait_until="domcontentloaded",
                 )
-                await page.wait_for_timeout(2000)
+                # Allow scripts and potential interstitial challenges a brief
+                # window to run before we capture the final HTML.
+                try:
+                    title = (await page.title()) or ""
+                except Exception:
+                    title = ""
+                lower_title = title.lower()
+                if "just a moment" in lower_title or "attention required" in lower_title:
+                    interstitial_seen = True
+                    await page.wait_for_load_state("networkidle", timeout=10000)
+                    await page.wait_for_timeout(2000)
+                    # Double-hop: retry once in the same context to pick up any
+                    # clearance cookies set by the interstitial.
+                    second = await page.goto(
+                        url,
+                        timeout=int(self.config.timeout * 1000),
+                        wait_until="networkidle",
+                    )
+                    if second is not None:
+                        response = second
+                else:
+                    await page.wait_for_timeout(2000)
                 domain = urlparse(url).netloc.lower()
                 dismissed_modal = await self._maybe_dismiss_signin_modal(page, domain)
                 if dismissed_modal:
@@ -1217,6 +2020,8 @@ class URLFetcher:
             metadata["signin_modal_dismissed"] = True
         if screenshot_path is not None:
             metadata["playwright_screenshot"] = str(screenshot_path)
+        if interstitial_seen:
+            metadata["interstitial_detected"] = True
         content_type_final = content_type.split(";")[0]
         return status, content_type_final, content, metadata, content.encode("utf-8", "ignore")
 
@@ -1285,7 +2090,39 @@ class URLFetcher:
             doc = fitz.open(stream=raw_bytes, filetype="pdf")
         except Exception as exc:
             raise RuntimeError(f"PDF open failed for {url}: {exc}") from exc
+        metadata: Dict[str, Any] = {}
         try:
+            # Guard early for encrypted/password-protected PDFs. PyMuPDF exposes
+            # `needs_pass` when a password is required before text extraction.
+            needs_password = bool(getattr(doc, "needs_pass", False))
+            if needs_password:
+                metadata.update(
+                    {
+                        "pdf_encrypted": True,
+                        "pdf_password_protected": True,
+                    }
+                )
+                password, crack_meta = _crack_pdf_password(raw_bytes, url)
+                metadata.update(crack_meta)
+                if password:
+                    try:
+                        doc.close()
+                    except Exception:
+                        pass
+                    try:
+                        doc = fitz.open(stream=raw_bytes, filetype="pdf", password=password)
+                    except Exception:
+                        doc = fitz.open(stream=raw_bytes, filetype="pdf")
+                        if not doc.authenticate(password):
+                            metadata.setdefault("pdf_password_crack_error", "authentication_failed")
+                            metadata["pdf_text_extracted"] = False
+                            return "", metadata
+                    metadata["pdf_password_recovered"] = True
+                else:
+                    metadata["pdf_password_recovered"] = False
+                    metadata["pdf_text_extracted"] = False
+                    return "", metadata
+
             text_parts: List[str] = []
             for page in doc:
                 page_text = page.get_text("text") or ""
@@ -1336,11 +2173,13 @@ class URLFetcher:
             if not full_text.strip():
                 raise RuntimeError(f"PDF extraction empty for {url}")
 
-            metadata = {
-                "pdf_text_extracted": True,
-                "pdf_pages": doc.page_count,
-                "pdf_characters": len(full_text),
-            }
+            metadata.update(
+                {
+                    "pdf_text_extracted": True,
+                    "pdf_pages": doc.page_count,
+                    "pdf_characters": len(full_text),
+                }
+            )
             if used_ocr:
                 metadata["pdf_ocr_fallback"] = True
             return full_text, metadata
@@ -1397,6 +2236,32 @@ def _load_path_allowlist() -> Dict[str, List[str]]:
             "/news",
         ])
     return mapping
+
+
+def _load_domain_allowlist() -> Set[str]:
+    raw = os.getenv("SPARTA_TOC_FANOUT_DOMAINS", "").strip()
+    domains: Set[str] = set()
+    if raw:
+        for token in raw.split(","):
+            token = token.strip().lower()
+            if token:
+                domains.add(token.lstrip("."))
+    if os.getenv("SPARTA_TOC_FANOUT_DOMAINS_DISABLE_DEFAULTS", "0") != "1":
+        domains.update({"attack.mitre.org", "d3fend.mitre.org", "mitre.org", "nist.gov", "csrc.nist.gov", "sparta.aerospace.org", "aerospace.org"})
+    return domains
+
+
+def _domain_matches_allowlist(host: str, allowed: Iterable[str]) -> Optional[str]:
+    if not host:
+        return None
+    normalized = host.strip().lower().rstrip(".")
+    for entry in allowed:
+        token = entry.strip().lower().lstrip(".")
+        if not token:
+            continue
+        if normalized == token or normalized.endswith(f".{token}"):
+            return token
+    return None
 
 
 def write_results(results: List[FetchResult], output_path: Path) -> None:
