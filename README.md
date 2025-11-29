@@ -41,13 +41,30 @@ fetcher/
 - Drop any mirrored PDFs or TXT files into `src/fetcher/data/local_sources/` if you need deterministic replacements.
 - Populate `src/fetcher/data/processed/controls_context.jsonl` with optional control metadata to enrich alternate generation.
 
+Need to refresh chronic mirrors (NASA links, DTIC PDFs, etc.)? Run the maintained CLI:
+
+```
+uv run python -m fetcher.tools.mirror_refresher \
+  --manifest src/fetcher/data/mirror_sources.json \
+  --out src/fetcher/data/local_sources
+```
+
+The manifest lists brittle URLs; the refresher fetches and writes them under `local_sources/` so overrides can reference file:// URIs deterministically.
+
 By default `FETCHER_TEXT_INLINE_MAX_BYTES=0`, so **all** response bodies are externalized to
 `run/artifacts/text_blobs/` and the JSON metadata only stores a pointer via `file_path`
 (`text_path` remains for backward compatibility). Set the environment variable to a positive byte
 threshold (e.g., `FETCHER_TEXT_INLINE_MAX_BYTES=200000`) if you want small payloads to remain
 inline inside the `.results.jsonl` file. When text is externalized, fetcher records
 `text_externalized`, `text_inline_missing`, and `text_length_chars` on each result so downstream
-pipelines know the original length even though the inline `text` field is blank.
+pipelines know the original length even though the inline `text` field is blank. If you want a
+shared blob cache across runs, set `FETCHER_TEXT_CACHE_DIR=/path/to/cache` and fetcher will dedupe
+by SHA-256 (run artifacts link to the cached file).
+
+Every `FetchResult` now also records `content_sha256`, `content_previous_sha256`,
+`content_changed`, and a `content_diff_ratio` when a prior snapshot exists. Hashes are tracked in
+`run_artifacts/fetch_cache/content_hashes.json`, making it trivial to see whether DOM/text changed
+between runs.
 
 ## Download modes & rolling windows
 
@@ -72,10 +89,10 @@ export FETCHER_PDF_CRACK_ENABLE=1
 export FETCHER_PDF_CRACK_CHARSET=0123456789
 export FETCHER_PDF_CRACK_MINLEN=4
 export FETCHER_PDF_CRACK_MAXLEN=6
-# optional: FETCHER_PDF_CRACK_PROCESSES, FETCHER_PDF_CRACK_TIMEOUT
+# optional: FETCHER_PDF_CRACK_PROCESSES, FETCHER_PDF_CRACK_TIMEOUT, FETCHER_PDF_BRUTE_LIMIT
 ```
 
-Fetcher will attempt a bounded brute-force when `pdf.needs_pass` is detected. Successful cracks proceed with normal extraction; failures are tagged `content_verdict="password_protected"` and skip downstream chunking.
+Fetcher will attempt a bounded brute-force when `pdf.needs_pass` is detected. Successful cracks proceed with normal extraction; failures are tagged `content_verdict="password_protected"` and skip downstream chunking. When `pdferli` cannot recover a password but the search space is small, `FETCHER_PDF_BRUTE_LIMIT` controls an optional PyMuPDF fallback (default 50 000 combinations).
 
 ## Link-hub fan-out
 
@@ -119,6 +136,10 @@ Every batch run writes telemetry to `run/artifacts/<run-id>/`, including:
 - `alternate_urls_applied.jsonl` (when Brave/Wayback alternates succeed)
 - `junk_results.jsonl` + `junk_summary.json` (every non-`ok` `content_verdict` for human/agent review)
 - `text_blobs/` and `downloads/` (the actual files referenced by `file_path` in the `.results.jsonl` output)
+
+Audit files now also embed `rate_limit_metrics` (overall runtime, effective RPS, per-domain 429 stats)
+and, when configured, a `proxy_rotation` block so operators can trace throttling and rotation usage
+without spelunking logs.
 
 ## Relationship to LiteLLM / SciLLM
 

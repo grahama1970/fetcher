@@ -19,6 +19,15 @@
 - Step 06 proxy rotation: when `SPARTA_STEP06_PROXY_*` env vars (or `IPROYAL_*` fallbacks) are present, throttled requests to allowlisted domains (default `d3fend.mitre.org`) are automatically retried through the configured rotating proxy before Wayback/Jina.
 - Triggers are configurable via `SPARTA_STEP06_PROXY_DOMAINS`, `SPARTA_STEP06_PROXY_STATUSES`, and `SPARTA_STEP06_PROXY_HINTS`; disable defaults with `SPARTA_STEP06_PROXY_DOMAINS_DISABLE_DEFAULTS=1` or turn the feature off entirely via `SPARTA_STEP06_PROXY_DISABLE=1`.
 - Fetch results carry `proxy_rotation_*` metadata (provider, reason, endpoint, error) and the Step 06 audit gains a `proxy_rotation` summary (attempts, successes, per-domain counts) so Ops can trace exactly when IP rotation was used.
+- Audits also include `rate_limit_metrics` (runtime + effective RPS + per-domain 429 counts) so you can spot slow domains before rotation is required.
+
+## Content tracking
+- Every `FetchResult` records `content_sha256`, `content_previous_sha256`, `content_changed`, and a `content_diff_ratio` (when prior samples exist). The shared cache lives under `run_artifacts/fetch_cache/content_hashes.json`.
+- Optional shared blob cache: set `FETCHER_TEXT_CACHE_DIR=/path/to/cache` and text blobs will dedupe across runs via SHA-256. Metadata points to the cached path so downstream agents can rehydrate bodies without copying them per run.
+
+## Mirror refresher
+- Run `uv run python -m fetcher.tools.mirror_refresher` to hydrate `src/fetcher/data/local_sources/` from the declarative manifest (`src/fetcher/data/mirror_sources.json`). This keeps override targets in sync for brittle NASA/DTIC/D3FEND sources.
+- Each manifest entry specifies `url` + `path`; the refresher downloads the byte stream, verifies SHA-256, and writes to the relative path so overrides can reference `file://` URIs.
 
 ## Outputs & auditability
 - `FetchResult` persists text digests and metadata to JSONL, suitable for knowledge stores.

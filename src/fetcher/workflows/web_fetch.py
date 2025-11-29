@@ -8,6 +8,7 @@ import itertools
 import re
 import json
 import logging
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import multiprocessing
@@ -718,7 +719,7 @@ class URLFetcher:
             "Accept-Language": self.config.accept_language,
             "Accept-Encoding": "gzip, deflate",
         }
-
+        start_time = time.perf_counter()
         async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
             # Phase 1: fetch provided entries
             tasks: List[asyncio.Task] = []
@@ -873,10 +874,11 @@ class URLFetcher:
         if self._cache_dirty and self.cache_path:
             await self._flush_cache_to_disk()
 
-        extra = getattr(self, "_last_fanout_stats", None)
+        runtime = max(0.001, time.perf_counter() - start_time)
+        rate_metrics = _summarize_rate_limits(results, runtime)
+        extra = getattr(self, "_last_fanout_stats", {}) or {}
+        extra["rate_limit_metrics"] = rate_metrics
         if self._proxy_audit is not None:
-            if extra is None:
-                extra = {}
             extra["proxy_rotation"] = self._proxy_audit
         audit = self._build_audit(results, len(unique_entries), extra=extra)
         return results, audit
@@ -2186,7 +2188,7 @@ class URLFetcher:
         finally:
             doc.close()
 
-    def _build_audit(self, results: List[FetchResult], target_total: int, *, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def _build_audit(self, results: List[FetchResult], target_total: int, *, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         successes = sum(1 for r in results if r.status == 200 and has_text_payload(r))
         failures = sum(1 for r in results if r.status != 200)
         audit = {
@@ -2205,7 +2207,30 @@ class URLFetcher:
             })
             if extra.get("proxy_rotation"):
                 audit["proxy_rotation"] = extra.get("proxy_rotation")
+            if extra.get("rate_limit_metrics"):
+                audit["rate_limit_metrics"] = extra.get("rate_limit_metrics")
         return audit
+
+
+def _summarize_rate_limits(results: List[FetchResult], runtime_seconds: float) -> Dict[str, Any]:
+    runtime = max(runtime_seconds, 1e-6)
+    per_domain: Dict[str, Dict[str, Any]] = defaultdict(lambda: {"requests": 0, "rate_limited": 0})
+    for result in results:
+        bucket = per_domain[result.domain]
+        bucket["requests"] += 1
+        if result.status == 429:
+            bucket["rate_limited"] += 1
+    per_domain_plain: Dict[str, Dict[str, Any]] = {}
+    for domain, stats in per_domain.items():
+        total = max(1, stats["requests"])
+        stats["rate_limited_pct"] = round(stats["rate_limited"] / total, 3)
+        stats["rps"] = round(stats["requests"] / runtime, 3)
+        per_domain_plain[domain] = dict(stats)
+    return {
+        "runtime_seconds": round(runtime, 3),
+        "effective_rps": round((len(results) or 0) / runtime, 3) if results else 0.0,
+        "per_domain": per_domain_plain,
+    }
 
 # ---------- Helpers for path allowlists (domain-specific) ----------
 def _load_path_allowlist() -> Dict[str, List[str]]:

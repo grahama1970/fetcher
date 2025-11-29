@@ -7,6 +7,7 @@ import json
 import os
 import re
 import mimetypes
+import shutil
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -50,6 +51,11 @@ def maybe_externalize_text(
 
     text_root = run_artifacts_dir / "text_blobs"
     text_root.mkdir(parents=True, exist_ok=True)
+    shared_root_env = os.getenv("FETCHER_TEXT_CACHE_DIR", "").strip()
+    shared_root: Optional[Path] = None
+    if shared_root_env:
+        shared_root = Path(shared_root_env).expanduser()
+        shared_root.mkdir(parents=True, exist_ok=True)
 
     for result in results:
         text = result.text or ""
@@ -60,15 +66,32 @@ def maybe_externalize_text(
             continue
 
         sha = hashlib.sha256(text_bytes).hexdigest()
-        blob_path = text_root / f"{sha}.txt"
-        blob_path.write_text(text, encoding="utf-8")
+        shared_path: Optional[Path] = None
+        if shared_root is not None:
+            shared_path = shared_root / f"{sha}.txt"
+            if not shared_path.exists():
+                shared_path.write_text(text, encoding="utf-8")
+        blob_path = shared_path or (text_root / f"{sha}.txt")
+        if shared_path is None:
+            blob_path.write_text(text, encoding="utf-8")
+        else:
+            run_copy = text_root / f"{sha}.txt"
+            if not run_copy.exists():
+                try:
+                    os.symlink(shared_path, run_copy)
+                except OSError:
+                    if not run_copy.exists():
+                        shutil.copy2(shared_path, run_copy)
+        resolved_path = shared_path or blob_path
 
         metadata = dict(result.metadata or {})
-        metadata[K_TEXT_PATH] = str(blob_path)
+        metadata[K_TEXT_PATH] = str(resolved_path)
         metadata["text_externalized"] = True
         metadata["text_inline_bytes"] = len(text_bytes)
         metadata["text_sha256"] = sha
-        metadata["file_path"] = str(blob_path)
+        metadata["file_path"] = str(resolved_path)
+        if shared_path is not None:
+            metadata["text_cache_path"] = str(shared_path)
         metadata["text_length_chars"] = len(text)
         metadata["text_inline_missing"] = True
 

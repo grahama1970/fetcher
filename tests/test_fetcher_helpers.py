@@ -2,12 +2,18 @@ import json
 from pathlib import Path
 
 from fetcher.workflows import fetcher, paywall_detector, paywall_utils
+from fetcher.workflows.fetcher import _annotate_content_changes
 from fetcher.workflows.fetcher_utils import resolve_repo_root
 from fetcher.workflows.download_utils import (
     apply_download_mode,
     maybe_externalize_text,
 )
-from fetcher.workflows.web_fetch import FetchResult, _select_wayback_timestamp, _domain_matches_allowlist
+from fetcher.workflows.web_fetch import (
+    FetchResult,
+    _select_wayback_timestamp,
+    _domain_matches_allowlist,
+    _summarize_rate_limits,
+)
 
 
 def test_resolve_repo_root_finds_data_dir(tmp_path: Path) -> None:
@@ -60,6 +66,28 @@ def test_maybe_externalize_text(tmp_path: Path) -> None:
     assert payload["text_length"] == 32
 
 
+def test_maybe_externalize_text_shared_cache(tmp_path: Path, monkeypatch) -> None:
+    cache_dir = tmp_path / "shared"
+    monkeypatch.setenv("FETCHER_TEXT_CACHE_DIR", str(cache_dir))
+    result = FetchResult(
+        url="https://example.com/shared",
+        domain="example.com",
+        status=200,
+        content_type="text/html",
+        text="cache-me",
+        fetched_at="now",
+        method="aiohttp",
+    )
+
+    run_dir = tmp_path / "run"
+    maybe_externalize_text([result], run_dir, max_inline_bytes=0)
+
+    metadata = result.metadata or {}
+    cache_path = cache_dir / f"{metadata['text_sha256']}.txt"
+    assert cache_path.exists()
+    assert metadata.get("file_path") == str(cache_path)
+
+
 def test_select_wayback_timestamp_prefers_first_column() -> None:
     payload = [
         ["timestamp", "original"],
@@ -77,6 +105,88 @@ def test_domain_matches_allowlist() -> None:
     allow = {"mitre.org"}
     assert _domain_matches_allowlist("attack.mitre.org", allow) == "mitre.org"
     assert _domain_matches_allowlist("example.com", allow) is None
+
+
+def test_content_change_tracker_detects_delta(tmp_path: Path) -> None:
+    cache_path = tmp_path / "hashes.json"
+    r1 = FetchResult(
+        url="https://example.com/resource",
+        domain="example.com",
+        status=200,
+        content_type="text/html",
+        text="alpha",
+        fetched_at="t1",
+        method="aiohttp",
+        metadata={"url_normalized": "https://example.com/resource"},
+    )
+    _annotate_content_changes([r1], cache_path)
+    assert cache_path.exists()
+    assert r1.metadata.get("content_changed") is True
+
+    r2 = FetchResult(
+        url="https://example.com/resource",
+        domain="example.com",
+        status=200,
+        content_type="text/html",
+        text="alpha",
+        fetched_at="t2",
+        method="aiohttp",
+        metadata={"url_normalized": "https://example.com/resource"},
+    )
+    _annotate_content_changes([r2], cache_path)
+    assert r2.metadata.get("content_changed") is False
+    assert r2.metadata.get("content_previous_sha256") == r1.metadata.get("content_sha256")
+
+    r3 = FetchResult(
+        url="https://example.com/resource",
+        domain="example.com",
+        status=200,
+        content_type="text/html",
+        text="alpha beta",
+        fetched_at="t3",
+        method="aiohttp",
+        metadata={"url_normalized": "https://example.com/resource"},
+    )
+    _annotate_content_changes([r3], cache_path)
+    assert r3.metadata.get("content_changed") is True
+    assert r3.metadata.get("content_previous_sha256") == r2.metadata.get("content_sha256")
+
+
+def test_summarize_rate_limits_helper() -> None:
+    results = [
+        FetchResult(
+            url="https://a.example",
+            domain="a.example",
+            status=200,
+            content_type="text/html",
+            text="",
+            fetched_at="now",
+            method="aiohttp",
+        ),
+        FetchResult(
+            url="https://a.example/limit",
+            domain="a.example",
+            status=429,
+            content_type="text/html",
+            text="",
+            fetched_at="now",
+            method="aiohttp",
+        ),
+        FetchResult(
+            url="https://b.example",
+            domain="b.example",
+            status=200,
+            content_type="text/html",
+            text="",
+            fetched_at="now",
+            method="aiohttp",
+        ),
+    ]
+    metrics = _summarize_rate_limits(results, runtime_seconds=2.0)
+    per_domain = metrics["per_domain"]
+    assert per_domain["a.example"]["requests"] == 2
+    assert per_domain["a.example"]["rate_limited"] == 1
+    assert per_domain["b.example"]["rate_limited"] == 0
 
 
 def test_apply_download_mode_download_only(tmp_path: Path) -> None:

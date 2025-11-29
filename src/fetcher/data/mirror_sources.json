@@ -1,0 +1,14 @@
+[
+  {
+    "url": "https://www.nasa.gov/mission_pages/rbsp/science/rbsp-spaceweather-human.html",
+    "path": "nasa/rbsp-spaceweather-human.html"
+  },
+  {
+    "url": "https://www.dtic.mil/dtic/tr/fulltext/u2/a487592.pdf",
+    "path": "dtic/a487592.pdf"
+  },
+  {
+    "url": "https://d3fend.mitre.org/dao/artifact/d3f:LogFile/",
+    "path": "d3fend/logfile.html"
+  }
+]

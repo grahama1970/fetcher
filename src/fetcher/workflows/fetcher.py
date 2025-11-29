@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import difflib
 import json
 import hashlib
 import mimetypes
@@ -20,7 +21,13 @@ import requests
 
 from dotenv import load_dotenv
 
-from .web_fetch import FetchConfig, FetchResult, URLFetcher, write_results
+from .web_fetch import (
+    FetchConfig,
+    FetchResult,
+    URLFetcher,
+    write_results,
+    _normalize_url as _wf_normalize_url,
+)
 from .paywall_detector import detect_paywall
 from .paywall_utils import resolve_paywalled_entries, reload_overrides_cache
 
@@ -221,6 +228,110 @@ def set_overrides_path(path: str | Path) -> None:
         DEFAULT_POLICY = replace(DEFAULT_POLICY, overrides_path=p)
 
 
+def _write_junk_report(results: List[FetchResult], run_artifacts_dir: Optional[Path]) -> None:
+    if run_artifacts_dir is None:
+        return
+    run_artifacts_dir.mkdir(parents=True, exist_ok=True)
+    junk_path = run_artifacts_dir / "junk_results.jsonl"
+    summary_path = run_artifacts_dir / "junk_summary.json"
+    counts: Dict[str, int] = {}
+    total = 0
+    with junk_path.open("w", encoding="utf-8") as fh:
+        for result in results:
+            metadata = result.metadata or {}
+            verdict = metadata.get("content_verdict")
+            if not verdict or verdict == "ok":
+                continue
+            payload = result.to_dict()
+            payload.pop("text", None)
+            fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            counts[verdict] = counts.get(verdict, 0) + 1
+            total += 1
+    summary = {"total": total, "counts_by_verdict": counts}
+    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _collect_pdf_paywall_mismatches(results: Iterable[FetchResult]) -> List[Dict[str, Any]]:
+    """Return URLs where PDF text was extracted but paywall signals remain.
+
+    These are high-value for audits: they indicate cases where generic
+    paywall/junk heuristics may be over-blocking long-form, publicly
+    accessible PDFs that we successfully parsed.
+    """
+
+    mismatches: List[Dict[str, Any]] = []
+    for result in results:
+        metadata = result.metadata or {}
+        if not metadata.get("pdf_text_extracted"):
+            continue
+        paywall_verdict = (metadata.get("paywall_verdict") or "").lower()
+        content_verdict = (metadata.get("content_verdict") or "").lower()
+        if paywall_verdict in {"likely", "maybe", "paywall"} or content_verdict == "paywall":
+            mismatches.append(
+                {
+                    "url": result.url,
+                    "domain": result.domain,
+                    "status": result.status,
+                    "paywall_verdict": paywall_verdict or None,
+                    "paywall_score": metadata.get("paywall_score"),
+                    "content_verdict": content_verdict or None,
+                    "pdf_pages": metadata.get("pdf_pages"),
+                    "pdf_characters": metadata.get("pdf_characters"),
+                }
+            )
+    return mismatches
+
+
+def _annotate_content_changes(results: List[FetchResult], cache_path: Path) -> None:
+    try:
+        cache = json.loads(cache_path.read_text(encoding="utf-8"))
+    except Exception:
+        cache = {}
+
+    dirty = False
+    for result in results:
+        metadata = dict(result.metadata or {})
+        normalized = metadata.get("url_normalized") or _wf_normalize_url(result.url)
+        if not normalized:
+            continue
+        if result.text:
+            payload = result.text.encode("utf-8")
+            sample = result.text[:800]
+        elif result.raw_bytes:
+            payload = result.raw_bytes
+            sample = ""
+        else:
+            continue
+        sha = hashlib.sha256(payload).hexdigest()
+        metadata["content_sha256"] = sha
+        metadata["content_text_len"] = len(result.text or "")
+        previous = cache.get(normalized)
+        if previous:
+            metadata["content_previous_sha256"] = previous.get("sha")
+            metadata["content_previous_len"] = previous.get("length")
+            metadata["content_previous_fetched_at"] = previous.get("fetched_at")
+            metadata["content_changed"] = sha != previous.get("sha")
+            prev_sample = previous.get("sample") or ""
+            if result.text and prev_sample:
+                ratio = difflib.SequenceMatcher(None, prev_sample, result.text[: len(prev_sample) or 1]).ratio()
+                metadata["content_diff_ratio"] = round(ratio, 4)
+        else:
+            metadata["content_changed"] = True
+
+        cache[normalized] = {
+            "sha": sha,
+            "length": len(result.text or ""),
+            "fetched_at": result.fetched_at,
+            "sample": sample,
+        }
+        result.metadata = metadata
+        dirty = True
+
+    if dirty:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 @dataclass(slots=True)
 class FetcherResult:
     """Outcome payload returned to pipeline steps."""
@@ -260,6 +371,8 @@ def run_fetch_pipeline(
         evaluate_result_content(result)
 
     annotate_paywall_metadata(results, policy)
+    hash_cache_path = run_artifacts_dir / "fetch_cache" / "content_hashes.json"
+    _annotate_content_changes(results, hash_cache_path)
 
     repo_root = resolve_repo_root(inventory_path)
 
@@ -287,11 +400,16 @@ def run_fetch_pipeline(
         policy,
     )
 
+    pdf_paywall_mismatches = _collect_pdf_paywall_mismatches(results)
+
     audit_payload = {
         **audit,
         "success": success,
         "failed": failed,
     }
+    if pdf_paywall_mismatches:
+        audit_payload["pdf_paywall_mismatches"] = pdf_paywall_mismatches
+        audit_payload["pdf_paywall_mismatches_count"] = len(pdf_paywall_mismatches)
     audit_path.parent.mkdir(parents=True, exist_ok=True)
     audit_path.write_text(json.dumps(audit_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
@@ -312,6 +430,7 @@ def run_fetch_pipeline(
     )
 
     write_results(results, output_path)
+    _write_junk_report(results, run_artifacts_dir)
 
     return FetcherResult(
         results=results,
@@ -414,6 +533,10 @@ def fetch_url(
     if not results:
         raise RuntimeError("Fetcher returned no result for the provided URL")
     result = results[0]
+
+    # Apply the same content-quality gate used in batch runs so single-URL
+    # fetches respect paywall/content heuristics consistently.
+    evaluate_result_content(result)
 
     annotate_paywall_metadata([result], DEFAULT_POLICY)
 

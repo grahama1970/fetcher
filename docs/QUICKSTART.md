@@ -107,7 +107,19 @@ export SPARTA_STEP06_PROXY_HINTS="rate limit,too many requests"
 
 When a throttled response (e.g., 429) matches the allowlist, the fetcher retries through the proxy before Wayback/Jina. Each proxied `FetchResult` advertises `proxy_rotation_*` metadata, and the audit JSON includes a `proxy_rotation` section summarizing attempts, successes, and per-domain usage so Step 06 operators can trace every rotation.
 
-## 9. Tests + lint
+## 9. Refresh brittle mirrors (optional)
+
+Keep local overrides deterministic by mirroring high-churn URLs into `src/fetcher/data/local_sources/`:
+
+```
+uv run python -m fetcher.tools.mirror_refresher \
+  --manifest src/fetcher/data/mirror_sources.json \
+  --out src/fetcher/data/local_sources
+```
+
+This CLI reads the manifest, fetches each URL, and writes the byte-for-byte copy under `local_sources/` so overrides can reference a stable `file://` path.
+
+## 10. Tests + lint
 ```bash
 uv run pytest
 uv run ruff check src
