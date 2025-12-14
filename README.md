@@ -139,7 +139,7 @@ Every batch run writes telemetry to `run/artifacts/<run-id>/`, including:
 - `text_blobs/` and `downloads/` (the actual files referenced by `file_path` in the `.results.jsonl` output)
 - `extracted_text/` (clean text artifacts; each `FetchResult` points to `extracted_text_path` when enabled)
 - `markdown/` (LLM-friendly markdown artifacts; enable via `FETCHER_EMIT_MARKDOWN=1`, stored under `markdown_path`)
-- `fit_markdown/` (pruned markdown artifacts for LLM input; emitted alongside markdown when `FETCHER_EMIT_FIT_MARKDOWN=1`, stored under `fit_markdown_path`)
+- `fit_markdown/` (pruned markdown artifacts for LLM input; emitted only when markdown is enabled and `FETCHER_EMIT_FIT_MARKDOWN=1`, stored under `fit_markdown_path`)
 - `changes.jsonl` – one line per URL whose content changed this run, including previous hash/timestamp and the latest diff ratio.
 
 For one-off debugging of “raw HTML vs markdown vs what the browser rendered”, use:

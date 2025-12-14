@@ -490,10 +490,15 @@ def verify_blob_content(result, blob_data: Optional[bytes]) -> None:
     except Exception:
         return
     reassessment = extract_content_features(text, result.content_type or "", result.url)
-    if reassessment.verdict != "ok":
-        metadata["content_verdict"] = "postcheck_failed"
-        metadata.setdefault("content_reasons", []).append("postcheck_reject")
+    # Postcheck is intended to catch corruption or unexpected decode/extraction
+    # problems after writing bytes to disk. Keep the primary verdict stable for
+    # downstream behavior, but record postcheck diagnostics explicitly.
+    metadata["postcheck_verdict"] = reassessment.verdict
+    metadata["postcheck_score"] = round(reassessment.score, 3)
+    metadata["postcheck_reasons"] = reassessment.reasons
     metadata["content_text_len_post"] = reassessment.text_len
+    if reassessment.verdict != "ok":
+        metadata["postcheck_failed"] = True
     result.metadata = metadata
 
 

@@ -57,7 +57,11 @@ automation can reason about the content. Specifically, fetcher MUST:
    - Markdown: `markdown_path` under `run/artifacts/.../markdown/` when
      `FETCHER_EMIT_MARKDOWN=1`.
    - Fit markdown: `fit_markdown_path` under `run/artifacts/.../fit_markdown/` when
-     `FETCHER_EMIT_FIT_MARKDOWN=1` (emitted alongside markdown).
+     markdown is enabled and `FETCHER_EMIT_FIT_MARKDOWN=1` (emitted alongside markdown).
+
+   Post-write verification:
+   - `verify_blob_content(...)` records `postcheck_*` diagnostics (e.g., `postcheck_verdict`,
+     `postcheck_failed`) without changing the primary `content_verdict`.
 
 6. **Alternates & Resolving** (`paywall_utils.resolve_paywalled_entries`)
    - If paywall verdict ∈ {maybe, likely} and policy allows, attempt Brave
