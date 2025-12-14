@@ -13,6 +13,16 @@
     "target_template": "https://r.jina.ai/{original}"
   },
   {
+    "domain": "d3fend.mitre.org",
+    "path_prefix": "/technique/",
+    "fit_markdown_selectors": ["main", "article", "[role='main']"]
+  },
+  {
+    "domain": "d3fend.mitre.org",
+    "path_prefix": "/tactic/",
+    "fit_markdown_selectors": ["main", "article", "[role='main']"]
+  },
+  {
     "domain": "atlas.mitre.org",
     "path_prefix": "/matrices/ATLAS",
     "target_url": "https://raw.githubusercontent.com/mitre-atlas/atlas-data/main/dist/ATLAS.yaml"
@@ -86,5 +96,81 @@
     "domain": "www.dtic.mil",
     "path_prefix": "/dtic/tr/fulltext/u2/",
     "target_template": "https://web.archive.org/web/0/{original}"
+  },
+  {
+    "domain": "www.cyberdefensemagazine.com",
+    "path_prefix": "/fancy-bear-hackers-use-a-new-mac-trojan-against-aerospace-industry",
+    "target_url": "file:///home/graham/workspace/experiments/devops/sparta/data/local_sources/cyberdefense_fancybear.html"
+  },
+  {
+    "domain": "cm.scholasticahq.com",
+    "path_prefix": "/article/5906.pdf",
+    "target_url": "https://files-cdn.cnblogs.com/files/miyeah/Satellite-Hacking-A-Guide-for-the-Perplexed.pdf"
+  },
+  {
+    "domain": "policy.defense.gov",
+    "path_prefix": "/Portals/11/Space%20Policy/ResilienceTaxonomyWhitePaperFinal.pdf",
+    "target_local_file": "resilience_taxonomy_whitepaper.pdf"
+  },
+  {
+    "domain": "medium.com",
+    "path_prefix": "/the-aerospace-corporation/hacking-an-on-orbit-satellite-an-analysis-of-the-cysat-2023-demo-ae241e5b8ee5",
+    "target_local_file": "medium_cysat_demo.pdf"
+  },
+  {
+    "domain": "spacepolicyonline.com",
+    "path_prefix": "/news/data-on-new-japanese-rocket-reportedly-stolen-by-computer-virus",
+    "target_local_file": "spacepolicy_japanese_rocket.pdf"
+  },
+  {
+    "domain": "www.cyberdefensemagazine.com",
+    "path_prefix": "/fancy-bear-hackers-use-a-new-mac-trojan-against-aerospace-industry",
+    "target_local_file": "cyberdefense_fancy_bear.pdf"
+  },
+  {
+    "domain": "www.china.org.cn",
+    "path_prefix": "/archive/2005-03/16/content_1122931.htm",
+    "target_local_file": "china_asiasat3s.pdf"
+  },
+  {
+    "domain": "www.mdpi.com",
+    "path_prefix": "/1424-8220/24/13/4210",
+    "target_local_file": "mdpi_gnss_jamming.pdf"
+  },
+  {
+    "domain": "www.theregister.co.uk",
+    "path_prefix": "/2011/04/18/esa_website_hack",
+    "target_local_file": "register_esa_hack.pdf"
+  },
+  {
+    "domain": "www.youtube.com",
+    "path_prefix": "/watch",
+    "query_contains": {"v": "QwjAZGoGjPo"},
+    "target_local_file": "youtube_gaddafists_tv.pdf"
+  },
+  {
+    "domain": "cybersecurityforme.com",
+    "path_prefix": "/csis-cyber-attack-incidents-timeline/",
+    "target_local_file": "cybersecurityforme_beginners_guide.pdf"
+  },
+  {
+    "domain": "us.norton.com",
+    "path_prefix": "/blog/malware/what-is-a-rootkit-and-how-to-stop-them",
+    "target_local_file": "norton_rootkit_overview.pdf"
+  },
+  {
+    "domain": "www.almaobservatory.org",
+    "path_prefix": "/alma-update-on-the-recovery-from-cyberattack",
+    "target_local_file": "eso_alma_update.pdf"
+  },
+  {
+    "domain": "www.researchgate.net",
+    "path_prefix": "/publication/363558808",
+    "target_local_file": "viasat_space_cybersecurity_lessons.pdf"
+  },
+  {
+    "domain": "www.reuters.com",
+    "path_prefix": "/article/us-nasa-hacking-idUSTRE81803S20120209",
+    "target_local_file": "reuters_nasa_hacking_20120209.txt"
   }
 ]

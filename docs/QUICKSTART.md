@@ -49,6 +49,13 @@ PY
 ```
 (You can also wire `FetcherPolicy` + `generate_alternate_urls` for production pipelines.)
 
+Notes:
+- `fetcher.workflows.fetcher.fetch_url(...)` disables link-hub fan-out by default so single-URL calls return quickly.
+- The CLI supports `--no-fanout` to disable fan-out for a specific run.
+- Fetch runs now also emit `extracted_text_path` (when `FETCHER_EMIT_EXTRACTED_TEXT=1`, default) and a `junk_table.md` summary under the run artifacts directory for easy triage.
+- Optional: emit LLM-friendly markdown with `FETCHER_EMIT_MARKDOWN=1` (writes `markdown_path` and `run/artifacts/.../markdown/*.md`).
+- Optional: emit pruned “fit markdown” with `FETCHER_EMIT_FIT_MARKDOWN=1` (default) (writes `fit_markdown_path` and `run/artifacts/.../fit_markdown/*.md`).
+
 ## 5. Optional alternates
 Install the extras and set SciLLM env vars:
 ```bash

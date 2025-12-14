@@ -6,7 +6,7 @@ from .fetcher import (
     FetcherResult,
     set_overrides_path,
 )
-from .web_fetch import FetchConfig, FetchResult, URLFetcher, write_results
+from .web_fetch import FetchConfig, FetchResult, ProxyRotationSettings, URLFetcher, write_results
 from .paywall_detector import detect_paywall
 from .paywall_utils import reload_overrides_cache
 
@@ -16,6 +16,7 @@ __all__ = [
     "FetcherResult",
     "FetchConfig",
     "FetchResult",
+    "ProxyRotationSettings",
     "URLFetcher",
     "write_results",
     "detect_paywall",

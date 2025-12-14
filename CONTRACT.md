@@ -14,6 +14,9 @@ automation can reason about the content. Specifically, fetcher MUST:
 - Fetch a URL (HTTP, Playwright, Brave, alternates) while honoring policy knobs.
 - Annotate each result with paywall verdict, content verdict, and provenance
   metadata before any artifacts are persisted.
+- Persist both the raw artifact (HTML/PDF bytes) and a human/LLM-friendly
+  representation (clean extracted text; optional markdown) so downstream steps
+  do not need to re-implement extraction to determine whether the URL is junk.
 - Persist blobs/rolling windows only when the content verdict is `ok`.
 - Surface unresolved URLs in `run/artifacts/outstanding_domains_summary.json`.
 
@@ -33,6 +36,7 @@ automation can reason about the content. Specifically, fetcher MUST:
 3. **Content Quality Gate** (`extract_utils.evaluate_result_content`)
    - Run trafilatura first, readability-lxml second.
    - Compute `content_verdict`, length, link density, paywall marker hits.
+   - Emit quick-triage flags: `usable`, `is_junk`, `junk_reason`.
    - If verdict != `ok`, mark the result as failed (no blob persists) and include
      excerpt + reasons in metadata.
 
@@ -46,6 +50,14 @@ automation can reason about the content. Specifically, fetcher MUST:
    - `rolling_extract`: persist blob plus JSONL rolling windows.
    - Post-write verification (`verify_blob_content`) re-checks saved bytes and
      updates metadata if corruption is detected.
+
+   Derived artifacts (deterministic, opt-in via env/policy):
+   - Extracted text: `extracted_text_path` under `run/artifacts/.../extracted_text/`
+     (default enabled via `FETCHER_EMIT_EXTRACTED_TEXT=1`).
+   - Markdown: `markdown_path` under `run/artifacts/.../markdown/` when
+     `FETCHER_EMIT_MARKDOWN=1`.
+   - Fit markdown: `fit_markdown_path` under `run/artifacts/.../fit_markdown/` when
+     `FETCHER_EMIT_FIT_MARKDOWN=1` (emitted alongside markdown).
 
 6. **Alternates & Resolving** (`paywall_utils.resolve_paywalled_entries`)
    - If paywall verdict ∈ {maybe, likely} and policy allows, attempt Brave
@@ -85,11 +97,15 @@ Acceptance criteria for this test:
    technique page should appear as `broken_or_moved` or `link_hub`.
 2. All `status == 200` rows in `docs/fetcher_sample_urls.results.jsonl` MUST have
    `content_verdict == "ok"` for narrative pages (D3FEND techniques, CNAS, etc.).
-   The JSONL stores only metadata + `text_path` pointers; raw HTML/text blobs live
+   The JSONL stores only metadata + `file_path` pointers; raw HTML/text blobs live
    under `run/artifacts/text_blobs/` and must not be checked into git.
-3. GitHub rewrites (blob -> raw) include `github_fetch_url` metadata and the
+3. Every run emits `run/artifacts/<run-id>/junk_table.md` + `junk_summary.json`
+   so a human/agent can quickly scan junk URLs and their reasons.
+4. Every run emits `run/artifacts/<run-id>/junk_results.jsonl` + `junk_summary.json`
+   listing the non-`ok` verdicts for human review.
+5. GitHub rewrites (blob -> raw) include `github_fetch_url` metadata and the
    saved blob exists on disk.
-4. No result with `content_verdict != "ok"` persists blobs or rolling windows.
+6. No result with `content_verdict != "ok"` persists blobs or rolling windows.
 
 ## 5. Required Unit Tests
 
@@ -107,11 +123,13 @@ All future changes must keep the following tests green:
   - `method` (aiohttp, playwright, pdf, wayback, github_cli, etc.).
   - `paywall_verdict`, `content_verdict`, `content_text_len`,
     `content_link_density`, `content_marker_hits`, `content_reasons`.
+  - `usable`, `is_junk`, `junk_reason` for quick triage.
 - `run/artifacts/<run-id>/` MUST contain:
   - `outstanding_domains_summary.json`
   - `outstanding_urls_summary.json`
   - `outstanding_controls_remaining.json`
   - `alternate_urls_applied.jsonl` (if alternates executed)
+  - `junk_table.md` for quick triage
 
 ## 7. Status & Hang Reporting
 

@@ -135,8 +135,15 @@ Every batch run writes telemetry to `run/artifacts/<run-id>/`, including:
 - `outstanding_controls_remaining.json`, `outstanding_urls_summary.json`, `outstanding_domains_summary.json`
 - `alternate_urls_applied.jsonl` (when Brave/Wayback alternates succeed)
 - `junk_results.jsonl` + `junk_summary.json` (every non-`ok` `content_verdict` for human/agent review)
+- `junk_table.md` (bounded markdown table for quick triage of junk URLs)
 - `text_blobs/` and `downloads/` (the actual files referenced by `file_path` in the `.results.jsonl` output)
+- `extracted_text/` (clean text artifacts; each `FetchResult` points to `extracted_text_path` when enabled)
+- `markdown/` (LLM-friendly markdown artifacts; enable via `FETCHER_EMIT_MARKDOWN=1`, stored under `markdown_path`)
+- `fit_markdown/` (pruned markdown artifacts for LLM input; emitted alongside markdown when `FETCHER_EMIT_FIT_MARKDOWN=1`, stored under `fit_markdown_path`)
 - `changes.jsonl` – one line per URL whose content changed this run, including previous hash/timestamp and the latest diff ratio.
+
+For one-off debugging of “raw HTML vs markdown vs what the browser rendered”, use:
+`uv run python scripts/compare_markdown_to_html.py --url <URL> --run-dir run/artifacts/<name>`
 
 Audit files now also embed `rate_limit_metrics` (overall runtime, effective RPS, per-domain 429 stats)
 and, when configured, a `proxy_rotation` block so operators can trace throttling and rotation usage

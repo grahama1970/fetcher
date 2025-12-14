@@ -12,18 +12,134 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlparse
 
+from bs4 import BeautifulSoup  # type: ignore
+
 try:  # spaCy is optional; fall back to regex segmentation when missing
     import spacy  # type: ignore
 except Exception:  # pragma: no cover - spaCy optional
     spacy = None  # type: ignore
 
 from .paywall_detector import detect_paywall
-from .extract_utils import verify_blob_content
+from .extract_utils import extract_content_features, verify_blob_content
 from .fetcher_utils import is_safe_domain as _is_safe_domain
 from .web_fetch import FetchResult
 from ..core.keys import K_TEXT_PATH
 
+try:  # trafilatura is optional, but installed in the default fetcher env
+    import trafilatura  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    trafilatura = None  # type: ignore
+
 _SPACY_SENTENCIZER = None
+
+_FIT_MARKDOWN_RULE_CACHE: Dict[str, List[Dict[str, Any]]] = {}
+
+
+def _load_fit_markdown_rules(overrides_path: Optional[Path]) -> List[Dict[str, Any]]:
+    if overrides_path is None:
+        return []
+    try:
+        key = str(overrides_path.resolve())
+    except Exception:
+        key = str(overrides_path)
+    if key in _FIT_MARKDOWN_RULE_CACHE:
+        return _FIT_MARKDOWN_RULE_CACHE[key]
+    rules: List[Dict[str, Any]] = []
+    try:
+        if overrides_path.exists():
+            data = json.loads(overrides_path.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                for item in data:
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get("fit_markdown_selectors"):
+                        rules.append(item)
+    except Exception:
+        rules = []
+    _FIT_MARKDOWN_RULE_CACHE[key] = rules
+    return rules
+
+
+def _pick_fit_markdown_selectors(url: str, overrides_path: Optional[Path]) -> List[str]:
+    rules = _load_fit_markdown_rules(overrides_path)
+    if not rules or not url:
+        return []
+    try:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        path = parsed.path or ""
+    except Exception:
+        return []
+
+    candidates: List[Tuple[int, List[str]]] = []
+    for rule in rules:
+        domain = str(rule.get("domain") or "").strip().lower()
+        if domain and domain != host:
+            continue
+        path_prefix = str(rule.get("path_prefix") or "").strip()
+        if path_prefix and not path.startswith(path_prefix):
+            continue
+        substr = str(rule.get("substring") or "").strip()
+        if substr and substr not in url:
+            continue
+        selectors = rule.get("fit_markdown_selectors") or []
+        if not isinstance(selectors, list):
+            continue
+        cleaned = [str(s).strip() for s in selectors if str(s).strip()]
+        if not cleaned:
+            continue
+        candidates.append((len(path_prefix), cleaned))
+    if not candidates:
+        return []
+    candidates.sort(key=lambda t: t[0], reverse=True)
+    return candidates[0][1]
+
+
+def _select_html_by_css(html: str, selectors: List[str]) -> str:
+    if not html or not selectors:
+        return html
+    try:
+        soup = BeautifulSoup(html, "lxml")
+    except Exception:
+        return html
+    picked = []
+    seen = set()
+    for sel in selectors:
+        try:
+            nodes = soup.select(sel)
+        except Exception:
+            continue
+        for node in nodes[:8]:
+            key = getattr(node, "name", None), id(node)
+            if key in seen:
+                continue
+            seen.add(key)
+            picked.append(str(node))
+        if picked:
+            break
+    if not picked:
+        return html
+    return "<html><body>\n" + "\n".join(picked) + "\n</body></html>"
+
+
+def _prune_markdown_to_first_h1(markdown: str) -> str:
+    """Best-effort pruning for LLM-friendly markdown.
+
+    Many markdown generators include stray UI tokens (e.g., `Esc`) before the
+    first real heading. Trim everything before the first top-level heading.
+    """
+
+    if not markdown:
+        return ""
+    lines = markdown.splitlines()
+    start = None
+    for idx, line in enumerate(lines):
+        if line.startswith("# "):
+            start = idx
+            break
+    if start is None:
+        return markdown.strip()
+    return "\n".join(lines[start:]).strip()
 
 
 def _get_spacy_sentencizer():
@@ -327,6 +443,173 @@ def apply_download_mode(
         result.raw_bytes = None
 
 
+def _read_raw_text_for_extraction(result: FetchResult) -> str:
+    """Return the best available raw payload for extraction.
+
+    Preference order:
+      - inline `result.text`
+      - `result.raw_bytes` decoded as utf-8
+      - `metadata[text_path]` or `metadata[file_path]` if it exists on disk
+      - `metadata[blob_path]` if it exists on disk
+    """
+
+    if result.text:
+        return result.text
+    if result.raw_bytes:
+        try:
+            return result.raw_bytes.decode("utf-8", "ignore")
+        except Exception:
+            pass
+    metadata = result.metadata or {}
+    for key in (K_TEXT_PATH, "file_path", "blob_path"):
+        raw = str(metadata.get(key) or "").strip()
+        if not raw:
+            continue
+        path = Path(raw)
+        if not path.is_absolute():
+            # Best-effort: treat relative paths as cwd-relative
+            path = Path.cwd() / path
+        try:
+            if path.exists():
+                return path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+    return ""
+
+
+def materialize_extracted_text(
+    results: Iterable[FetchResult],
+    run_artifacts_dir: Path,
+    *,
+    enabled: bool = True,
+    min_chars: int = 1,
+) -> None:
+    """Persist extracted/clean text as a first-class artifact.
+
+    This makes it trivial for humans/agents to inspect whether a fetched URL is
+    usable without re-running extraction logic elsewhere.
+    """
+
+    if not enabled:
+        return
+    out_dir = run_artifacts_dir / "extracted_text"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    for result in results:
+        metadata = dict(result.metadata or {})
+        if (metadata.get("content_verdict") or "").lower() != "ok":
+            continue
+        raw = _read_raw_text_for_extraction(result)
+        if not raw.strip():
+            continue
+        assessment = extract_content_features(raw, result.content_type or "text/html", result.url)
+        extracted = (assessment.text or "").strip()
+        if len(extracted) < max(1, int(min_chars)):
+            continue
+        payload = extracted.encode("utf-8")
+        sha = hashlib.sha256(payload).hexdigest()
+        path = out_dir / f"{sha}.txt"
+        if not path.exists():
+            path.write_text(extracted + "\n", encoding="utf-8")
+        metadata["extracted_text_path"] = str(path)
+        metadata["extracted_text_sha256"] = sha
+        metadata["extracted_text_len"] = len(extracted)
+        metadata["extracted_text_source"] = assessment.source
+        result.metadata = metadata
+
+
+def materialize_markdown(
+    results: Iterable[FetchResult],
+    run_artifacts_dir: Path,
+    *,
+    enabled: bool = False,
+    min_chars: int = 1,
+    emit_fit_markdown: bool = True,
+    fit_min_chars: int = 200,
+    overrides_path: Optional[Path] = None,
+) -> None:
+    """Persist an LLM-friendly markdown artifact for HTML-ish pages.
+
+    This is opt-in because it is more expensive than writing raw blobs.
+    """
+
+    if not enabled:
+        return
+    if trafilatura is None:
+        return
+    out_dir = run_artifacts_dir / "markdown"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fit_dir = run_artifacts_dir / "fit_markdown"
+    fit_dir.mkdir(parents=True, exist_ok=True)
+
+    for result in results:
+        metadata = dict(result.metadata or {})
+        if (metadata.get("content_verdict") or "").lower() != "ok":
+            continue
+        raw = _read_raw_text_for_extraction(result)
+        if not raw.strip():
+            continue
+        # Only attempt markdown conversion when the payload is likely HTML.
+        ct = (result.content_type or "").lower()
+        looks_html = ("html" in ct) or ("<html" in raw.lower()) or ("</" in raw and "<" in raw)
+        if not looks_html:
+            continue
+        try:
+            md = trafilatura.extract(
+                raw,
+                url=result.url,
+                include_tables=True,
+                favor_recall=True,
+                output_format="markdown",
+            )
+        except Exception:
+            md = None
+        md = (md or "").strip()
+        if len(md) < max(1, int(min_chars)):
+            continue
+        payload = md.encode("utf-8")
+        sha = hashlib.sha256(payload).hexdigest()
+        path = out_dir / f"{sha}.md"
+        if not path.exists():
+            path.write_text(md + "\n", encoding="utf-8")
+        metadata["markdown_path"] = str(path)
+        metadata["markdown_sha256"] = sha
+        metadata["markdown_len"] = len(md)
+        metadata["markdown_backend"] = "trafilatura"
+        result.metadata = metadata
+
+        if emit_fit_markdown:
+            selectors = _pick_fit_markdown_selectors(result.url, overrides_path)
+            reduced_html = _select_html_by_css(raw, selectors) if selectors else raw
+            try:
+                fit_md = trafilatura.extract(
+                    reduced_html,
+                    url=result.url,
+                    include_tables=True,
+                    favor_recall=True,
+                    output_format="markdown",
+                )
+            except Exception:
+                fit_md = None
+            fit_md = _prune_markdown_to_first_h1((fit_md or "").strip())
+            if len(fit_md) >= max(1, int(fit_min_chars)):
+                fit_payload = fit_md.encode("utf-8")
+                fit_sha = hashlib.sha256(fit_payload).hexdigest()
+                fit_path = fit_dir / f"{fit_sha}.md"
+                if not fit_path.exists():
+                    fit_path.write_text(fit_md + "\n", encoding="utf-8")
+                metadata = dict(result.metadata or {})
+                metadata["fit_markdown_path"] = str(fit_path)
+                metadata["fit_markdown_sha256"] = fit_sha
+                metadata["fit_markdown_len"] = len(fit_md)
+                metadata["fit_markdown_backend"] = "trafilatura_prune"
+                if selectors:
+                    metadata["fit_markdown_selectors"] = selectors
+                # "usable" heuristic: long enough and contains a top-level heading.
+                metadata["fit_markdown_usable"] = bool(fit_md.startswith("# ") and len(fit_md) >= max(1, int(fit_min_chars)))
+                result.metadata = metadata
+
+
 def annotate_paywall_metadata(results: Iterable[FetchResult], policy) -> None:
     for result in results:
         domain = result.domain or urlparse(result.url).netloc
@@ -340,7 +623,24 @@ def annotate_paywall_metadata(results: Iterable[FetchResult], policy) -> None:
                 metadata["paywall_score"] = 0.0
                 result.metadata = metadata
                 continue
+        # If body is empty, still mark paywall suspicion when domain/status hints match.
         if not result.text:
+            metadata = dict(result.metadata or {})
+            suspected = False
+            if domain and policy and domain in getattr(policy, "paywall_domains", set()):
+                suspected = True
+            if getattr(result, "status", None) in getattr(policy, "paywall_status_codes", set()):
+                suspected = True
+            if suspected:
+                detection = {
+                    "verdict": "maybe",
+                    "score": 0.6,
+                    "indicators": {"no_text_body": True},
+                }
+                metadata["paywall_detection"] = detection
+                metadata["paywall_verdict"] = detection["verdict"]
+                metadata["paywall_score"] = detection["score"]
+                result.metadata = metadata
             continue
         ct = (result.content_type or "").lower()
         if "html" not in ct:
@@ -374,6 +674,8 @@ __all__ = [
     "annotate_paywall_metadata",
     "apply_download_mode",
     "build_rolling_windows",
+    "materialize_extracted_text",
+    "materialize_markdown",
     "maybe_externalize_text",
     "sanity_check",
 ]

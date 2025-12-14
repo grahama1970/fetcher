@@ -18,12 +18,15 @@ def _result(
     status: int,
     verdict: str | None = None,
     content_verdict: str | None = None,
+    metadata_extra: dict | None = None,
 ) -> FetchResult:
-    metadata = {}
+    metadata: dict = {}
     if verdict:
         metadata["paywall_verdict"] = verdict
     if content_verdict:
         metadata["content_verdict"] = content_verdict
+    if metadata_extra:
+        metadata.update(metadata_extra)
     return FetchResult(
         url=url,
         domain=domain,
@@ -50,6 +53,27 @@ def test_generate_outstanding_summary_categories():
         {"url": "https://www.cisa.gov/alert", "domain": "www.cisa.gov", "status": 403, "control_count": 1, "worksheets": []},
         {"url": "https://paywall.example.com/post", "domain": "paywall.example.com", "status": 451, "control_count": 1, "worksheets": []},
         {"url": "https://missing.example.com/post", "domain": "missing.example.com", "status": 404, "control_count": 1, "worksheets": []},
+        {
+            "url": "https://www.cyberdefensemagazine.com/bot",
+            "domain": "www.cyberdefensemagazine.com",
+            "status": 403,
+            "control_count": 1,
+            "worksheets": [],
+        },
+        {
+            "url": "https://secure.example.net/protected.pdf",
+            "domain": "secure.example.net",
+            "status": 200,
+            "control_count": 1,
+            "worksheets": [],
+        },
+        {
+            "url": "https://cm.scholasticahq.com/article/5906.pdf",
+            "domain": "cm.scholasticahq.com",
+            "status": 200,
+            "control_count": 1,
+            "worksheets": [],
+        },
     ]
     results_map = {
         "https://example.org/doc": _result("https://example.org/doc", "example.org", 200, verdict=None),
@@ -60,11 +84,31 @@ def test_generate_outstanding_summary_categories():
             451,
             verdict="likely",
         ),
-        "https://missing.example.com/post": _result(
-            "https://missing.example.com/post",
-            "missing.example.com",
-            404,
+        "https://missing.example.com/post": _result("https://missing.example.com/post", "missing.example.com", 404, verdict=None),
+        "https://www.cyberdefensemagazine.com/bot": _result(
+            "https://www.cyberdefensemagazine.com/bot",
+            "www.cyberdefensemagazine.com",
+            403,
             verdict=None,
+            content_verdict="thin",
+            metadata_extra={
+                "hub_title": "Just a moment...",
+                "content_excerpt": "<html>Just a moment... Cloudflare is checking your browser...</html>",
+            },
+        ),
+        "https://secure.example.net/protected.pdf": _result(
+            "https://secure.example.net/protected.pdf",
+            "secure.example.net",
+            200,
+            verdict=None,
+            content_verdict="password_protected",
+        ),
+        "https://cm.scholasticahq.com/article/5906.pdf": _result(
+            "https://cm.scholasticahq.com/article/5906.pdf",
+            "cm.scholasticahq.com",
+            200,
+            verdict=None,
+            content_verdict="missing_file",
         ),
     }
 
@@ -73,4 +117,7 @@ def test_generate_outstanding_summary_categories():
     assert counts["needs_whitelist"] == 1
     assert counts["needs_login_or_playwright"] == 1
     assert counts["paywall"] == 1
-    assert counts["broken_or_moved"] == 1
+    assert counts["broken_or_moved"] == 2
+    # New bot-blocked category should be populated for Cloudflare-style interstitials.
+    assert counts["bot_blocked"] == 1
+    assert counts["password_protected"] == 1

@@ -1,4 +1,8 @@
-"""HTML normalization helpers for paywall detection and preprocessing."""
+"""HTML normalization helpers for Readability-friendly extraction.
+
+This module is deterministic and provider-agnostic. It exists to make
+extraction (trafilatura/readability) more reliable across brittle pages.
+"""
 
 from __future__ import annotations
 
@@ -6,11 +10,15 @@ import re
 import unicodedata
 from typing import Mapping, Optional
 
+import ftfy
 from bs4 import BeautifulSoup
 from charset_normalizer import from_bytes
-import ftfy
 from lxml.html.clean import Cleaner
-from readability import Document  # type: ignore
+
+try:  # readability-lxml
+    from readability import Document  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    Document = None  # type: ignore
 
 __all__ = [
     "decode_bytes_auto",
@@ -18,6 +26,7 @@ __all__ = [
     "repair_markup",
     "clean_conservative",
     "readability_text_len_robust",
+    "readability_extract_text_robust",
 ]
 
 _ZERO_WIDTH = {0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF}
@@ -87,53 +96,61 @@ def clean_conservative(html: str) -> str:
         return html
 
 
-def _readability_extract_len(html: str) -> int:
-    html = html.translate(str.maketrans('', '', ''.join(chr(i) for i in range(0x20))))
+def _readability_extract_text(html: str) -> str:
+    if Document is None:
+        return ""
+    # Strip control chars (0x00-0x1F) that can break readability's XML parser.
+    html = html.translate(str.maketrans("", "", "".join(chr(i) for i in range(0x20))))
     if not html:
-        return 0
+        return ""
     doc = Document(html)
     snippet = doc.summary(html_partial=True)
     text = BeautifulSoup(snippet, "lxml").get_text(" ", strip=True)
-    return len(text)
+    return text or ""
 
 
-def readability_text_len_robust(html: str) -> int:
+def readability_extract_text_robust(html: str) -> str:
     """Run Readability with staged fallbacks to avoid crashes on malformed HTML."""
 
     if not html:
-        return 0
+        return ""
 
-    def _attempt(payload: str) -> int:
+    def _attempt(payload: str) -> str:
         if not payload:
-            return 0
+            return ""
         try:
-            return _readability_extract_len(payload)
+            return _readability_extract_text(payload)
         except Exception:
-            return 0
+            return ""
 
-    length = _attempt(html)
-    if length:
-        return length
+    # 1) raw html
+    text = _attempt(html)
+    if text:
+        return text
 
     fixed = minimal_text_fix(html)
-    length = _attempt(fixed)
-    if length:
-        return length
+    text = _attempt(fixed)
+    if text:
+        return text
 
     repaired = repair_markup(fixed)
-    length = _attempt(repaired)
-    if length:
-        return length
+    text = _attempt(repaired)
+    if text:
+        return text
 
     cleaned = clean_conservative(repaired)
-    length = _attempt(cleaned)
-    if length:
-        return length
+    text = _attempt(cleaned)
+    if text:
+        return text
 
+    # Last resort: heuristic content region selection.
     try:
         soup = BeautifulSoup(repaired, "lxml")
     except Exception:
-        soup = BeautifulSoup(html, "lxml")
+        try:
+            soup = BeautifulSoup(html, "lxml")
+        except Exception:
+            return ""
 
     for tag in soup(["script", "style", "noscript"]):
         try:
@@ -141,7 +158,6 @@ def readability_text_len_robust(html: str) -> int:
         except Exception:
             continue
 
-    candidates: list[int] = []
     selectors = [
         "article",
         "main",
@@ -159,19 +175,23 @@ def readability_text_len_robust(html: str) -> int:
         except Exception:
             continue
         for node in nodes[:8]:
-            text = node.get_text(" ", strip=True)
-            if text:
-                candidates.append(len(text))
-        if candidates:
-            break
+            candidate = node.get_text(" ", strip=True)
+            if candidate:
+                return candidate
 
-    if not candidates:
-        para_texts = []
-        for node in soup.find_all("p")[:400]:
-            txt = node.get_text(" ", strip=True)
-            if txt:
-                para_texts.append(len(txt))
-        if para_texts:
-            candidates.append(sum(para_texts))
+    # Fallback to concatenated paragraph text.
+    paras = []
+    for node in soup.find_all("p")[:400]:
+        txt = node.get_text(" ", strip=True)
+        if txt:
+            paras.append(txt)
+    return " ".join(paras).strip()
 
-    return max(candidates) if candidates else 0
+
+def readability_text_len_robust(html: str) -> int:
+    """Backwards-compatible helper for paywall heuristics."""
+
+    try:
+        return len(readability_extract_text_robust(html) or "")
+    except Exception:
+        return 0

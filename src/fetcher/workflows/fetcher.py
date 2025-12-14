@@ -69,6 +69,8 @@ from .download_utils import (
     annotate_paywall_metadata,
     apply_download_mode,
     maybe_externalize_text,
+    materialize_extracted_text,
+    materialize_markdown,
 )
 from .extract_utils import evaluate_result_content
 from .outstanding_utils import build_outstanding_reports
@@ -98,6 +100,11 @@ def _env_int(name: str, default: int = 0) -> int:
         return int(raw) if raw.strip() else default
     except (TypeError, ValueError):
         return default
+
+
+def _env_bool(name: str, default: str = "0") -> bool:
+    raw = os.getenv(name, default)
+    return str(raw).strip().lower() not in {"0", "false", "no", "off", ""}
 
 
 TEXT_INLINE_MAX_BYTES = _env_int("FETCHER_TEXT_INLINE_MAX_BYTES", 0)
@@ -180,6 +187,12 @@ class FetcherPolicy:
     debug: DebugTuning = DebugTuning()
     use_wayback_on_404: bool = False
     text_inline_max_bytes: int = 0
+    emit_extracted_text: bool = True
+    extracted_text_min_chars: int = 1
+    emit_markdown: bool = False
+    markdown_min_chars: int = 1
+    emit_fit_markdown: bool = True
+    fit_markdown_min_chars: int = 200
 
 
 DEFAULT_POLICY = FetcherPolicy(
@@ -192,6 +205,12 @@ DEFAULT_POLICY = FetcherPolicy(
     overrides_path=OVERRIDES_PATH,
     local_sources_dir=LOCAL_SOURCES_DIR,
     text_inline_max_bytes=TEXT_INLINE_MAX_BYTES,
+    emit_extracted_text=_env_bool("FETCHER_EMIT_EXTRACTED_TEXT", "1"),
+    extracted_text_min_chars=max(1, _env_int("FETCHER_EXTRACTED_TEXT_MIN_CHARS", 1)),
+    emit_markdown=_env_bool("FETCHER_EMIT_MARKDOWN", "0"),
+    markdown_min_chars=max(1, _env_int("FETCHER_MARKDOWN_MIN_CHARS", 1)),
+    emit_fit_markdown=_env_bool("FETCHER_EMIT_FIT_MARKDOWN", "1"),
+    fit_markdown_min_chars=max(1, _env_int("FETCHER_FIT_MARKDOWN_MIN_CHARS", 200)),
 )
 
 
@@ -234,8 +253,19 @@ def _write_junk_report(results: List[FetchResult], run_artifacts_dir: Optional[P
     run_artifacts_dir.mkdir(parents=True, exist_ok=True)
     junk_path = run_artifacts_dir / "junk_results.jsonl"
     summary_path = run_artifacts_dir / "junk_summary.json"
+    table_path = run_artifacts_dir / "junk_table.md"
     counts: Dict[str, int] = {}
+    domains: Dict[str, Dict[str, int]] = {}
+    examples: Dict[str, List[Dict[str, Any]]] = {}
     total = 0
+    try:
+        max_rows = int(os.getenv("FETCHER_JUNK_TABLE_MAX_ROWS", "200"))
+    except Exception:
+        max_rows = 200
+    try:
+        max_examples = int(os.getenv("FETCHER_JUNK_EXAMPLES_PER_VERDICT", "8"))
+    except Exception:
+        max_examples = 8
     with junk_path.open("w", encoding="utf-8") as fh:
         for result in results:
             metadata = result.metadata or {}
@@ -246,9 +276,66 @@ def _write_junk_report(results: List[FetchResult], run_artifacts_dir: Optional[P
             payload.pop("text", None)
             fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
             counts[verdict] = counts.get(verdict, 0) + 1
+            domain = str(payload.get("domain") or result.domain or "")
+            if domain:
+                domains.setdefault(domain, {})
+                domains[domain][verdict] = domains[domain].get(verdict, 0) + 1
+            if max_examples > 0:
+                bucket = examples.setdefault(str(verdict), [])
+                if len(bucket) < max_examples:
+                    bucket.append(
+                        {
+                            "url": payload.get("url"),
+                            "domain": domain or None,
+                            "status": payload.get("status"),
+                            "method": payload.get("method"),
+                            "junk_reason": payload.get("junk_reason"),
+                            "content_reasons": payload.get("content_reasons"),
+                        }
+                    )
             total += 1
-    summary = {"total": total, "counts_by_verdict": counts}
+    summary = {
+        "total": total,
+        "counts_by_verdict": counts,
+        "counts_by_domain": domains,
+        "examples_by_verdict": examples,
+    }
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    # Human-friendly triage view (bounded).
+    try:
+        rows = []
+        for result in results:
+            metadata = result.metadata or {}
+            verdict = metadata.get("content_verdict")
+            if not verdict or verdict == "ok":
+                continue
+            payload = result.to_dict()
+            url = str(payload.get("url") or "")
+            domain = str(payload.get("domain") or "")
+            status = str(payload.get("status") or "")
+            method = str(payload.get("method") or "")
+            reasons = payload.get("content_reasons") or []
+            if isinstance(reasons, list):
+                reasons_txt = ", ".join(str(r) for r in reasons if r)
+            else:
+                reasons_txt = str(reasons)
+            junk_reason = str(payload.get("junk_reason") or "")
+            rows.append((str(verdict), status, domain, method, junk_reason, reasons_txt, url))
+        rows.sort(key=lambda r: (r[0], r[2], r[1], r[6]))
+        if max_rows > 0:
+            rows = rows[:max_rows]
+        header = "| verdict | status | domain | method | junk_reason | content_reasons | url |\n"
+        sep = "|---|---:|---|---|---|---|---|\n"
+        lines = [header, sep]
+        for verdict, status, domain, method, junk_reason, reasons_txt, url in rows:
+            reasons_cell = (reasons_txt[:180] + "…") if len(reasons_txt) > 180 else reasons_txt
+            lines.append(
+                f"| {verdict} | {status} | {domain} | {method} | {junk_reason} | {reasons_cell} | {url} |\n"
+            )
+        table_path.write_text("".join(lines), encoding="utf-8")
+    except Exception:
+        pass
 
 
 def _collect_pdf_paywall_mismatches(results: Iterable[FetchResult]) -> List[Dict[str, Any]]:
@@ -370,6 +457,7 @@ class FetcherResult:
     applied_alternates: List[Dict[str, Any]]
     outstanding_controls: int
     outstanding_urls: int
+    news_abstracts: int = 0
 
 def run_fetch_pipeline(
     entries: List[Dict[str, Any]],
@@ -390,6 +478,14 @@ def run_fetch_pipeline(
 ) -> FetcherResult:
     """Primary entrypoint used by pipeline scripts."""
 
+    if os.getenv("FETCHER_HTTP_CACHE_DISABLE", "0") == "1":
+        fetch_config.disable_http_cache = True
+        cache_path = None
+    if fetch_config.overrides_path is None:
+        # Env override path wins over policy default
+        env_overrides = os.getenv("FETCHER_OVERRIDES_PATH")
+        fetch_config.overrides_path = Path(env_overrides) if env_overrides else policy.overrides_path
+
     if fetch_config.screenshots_dir is None:
         fetch_config.screenshots_dir = run_artifacts_dir / "screenshots"
 
@@ -398,6 +494,24 @@ def run_fetch_pipeline(
 
     for result in results:
         evaluate_result_content(result)
+
+    # Persist extracted/clean text so consumers (and humans) can easily inspect
+    # usable content without re-implementing extraction in downstream repos.
+    materialize_extracted_text(
+        results,
+        run_artifacts_dir,
+        enabled=bool(getattr(policy, "emit_extracted_text", True)),
+        min_chars=int(getattr(policy, "extracted_text_min_chars", 1) or 1),
+    )
+    materialize_markdown(
+        results,
+        run_artifacts_dir,
+        enabled=bool(getattr(policy, "emit_markdown", False)),
+        min_chars=int(getattr(policy, "markdown_min_chars", 1) or 1),
+        emit_fit_markdown=bool(getattr(policy, "emit_fit_markdown", True)),
+        fit_min_chars=int(getattr(policy, "fit_markdown_min_chars", 200) or 200),
+        overrides_path=getattr(policy, "overrides_path", None),
+    )
 
     annotate_paywall_metadata(results, policy)
     hash_cache_path = run_artifacts_dir / "fetch_cache" / "content_hashes.json"
@@ -421,6 +535,7 @@ def run_fetch_pipeline(
 
     success = sum(1 for r in results if r.status == 200 and has_text_payload(r))
     failed = sum(1 for r in results if r.status != 200)
+    news_abstract_count = sum(1 for r in results if (r.metadata or {}).get("news_abstract"))
 
     outstanding_controls, outstanding_urls = build_outstanding_reports(
         entries,
@@ -436,6 +551,8 @@ def run_fetch_pipeline(
         "success": success,
         "failed": failed,
     }
+    if news_abstract_count:
+        audit_payload["news_abstracts"] = news_abstract_count
     if pdf_paywall_mismatches:
         audit_payload["pdf_paywall_mismatches"] = pdf_paywall_mismatches
         audit_payload["pdf_paywall_mismatches_count"] = len(pdf_paywall_mismatches)
@@ -469,6 +586,7 @@ def run_fetch_pipeline(
         applied_alternates=applied,
         outstanding_controls=outstanding_controls,
         outstanding_urls=outstanding_urls,
+        news_abstracts=news_abstract_count,
     )
 
 
@@ -498,6 +616,13 @@ def deterministic_batch_check(
     - Uses validation fetches for any alternates before writing changes.
     - Writes standard audit/outstanding reports under run_artifacts_dir.
     """
+
+    if os.getenv("FETCHER_HTTP_CACHE_DISABLE", "0") == "1":
+        fetch_config.disable_http_cache = True
+        cache_path = None
+    if fetch_config.overrides_path is None:
+        env_overrides = os.getenv("FETCHER_OVERRIDES_PATH")
+        fetch_config.overrides_path = Path(env_overrides) if env_overrides else policy.overrides_path
 
     result = run_fetch_pipeline(
         entries=entries,
@@ -556,6 +681,11 @@ def fetch_url(
         K_WORKSHEETS: [],
     }
     config = fetch_config or FetchConfig()
+    if os.getenv("FETCHER_HTTP_CACHE_DISABLE", "0") == "1":
+        config.disable_http_cache = True
+    # Single-URL calls should not unexpectedly fan out into hub children.
+    if getattr(config, "enable_toc_fanout", None) is None:
+        config.enable_toc_fanout = False
     artifacts_dir = run_artifacts_dir or Path(os.getenv("FETCHER_SINGLE_RUN_ARTIFACTS", "run")) / "artifacts"
     if config.screenshots_dir is None:
         config.screenshots_dir = artifacts_dir / "screenshots"
@@ -568,6 +698,22 @@ def fetch_url(
     # Apply the same content-quality gate used in batch runs so single-URL
     # fetches respect paywall/content heuristics consistently.
     evaluate_result_content(result)
+
+    materialize_extracted_text(
+        [result],
+        artifacts_dir,
+        enabled=bool(getattr(DEFAULT_POLICY, "emit_extracted_text", True)),
+        min_chars=int(getattr(DEFAULT_POLICY, "extracted_text_min_chars", 1) or 1),
+    )
+    materialize_markdown(
+        [result],
+        artifacts_dir,
+        enabled=bool(getattr(DEFAULT_POLICY, "emit_markdown", False)),
+        min_chars=int(getattr(DEFAULT_POLICY, "markdown_min_chars", 1) or 1),
+        emit_fit_markdown=bool(getattr(DEFAULT_POLICY, "emit_fit_markdown", True)),
+        fit_min_chars=int(getattr(DEFAULT_POLICY, "fit_markdown_min_chars", 200) or 200),
+        overrides_path=getattr(DEFAULT_POLICY, "overrides_path", None),
+    )
 
     annotate_paywall_metadata([result], DEFAULT_POLICY)
 
@@ -628,6 +774,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--per-domain", type=int, help="Max concurrent fetches per domain")
     parser.add_argument("--resolver-limit", type=int, default=24, help="Resolver limit per batch")
     parser.add_argument("--no-resolver", action="store_true", help="Disable alternate resolvers")
+    parser.add_argument("--no-http-cache", action="store_true", help="Disable HTTP cache read/write for this run")
+    parser.add_argument(
+        "--no-fanout",
+        action="store_true",
+        help="Disable link-hub fan-out (Phase 2) for this run",
+    )
     parser.add_argument("--download-mode", choices=["text", "download_only", "rolling_extract"], help="Override download mode for this run")
     parser.add_argument("--window-size", type=int, help="Rolling window size (characters)")
     parser.add_argument("--window-step", type=int, help="Rolling window hop (characters)")
@@ -648,6 +800,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             config.concurrency = args.concurrency
         if args.per_domain:
             config.per_domain = args.per_domain
+        config.disable_http_cache = args.no_http_cache or (os.getenv("FETCHER_HTTP_CACHE_DISABLE", "0") == "1")
+        if args.no_fanout:
+            config.enable_toc_fanout = False
+        config.overrides_path = DEFAULT_POLICY.overrides_path
         result = fetch_url(
             args.url,
             fetch_config=config,
@@ -680,6 +836,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         fetch_config.concurrency = args.concurrency
     if args.per_domain:
         fetch_config.per_domain = args.per_domain
+    fetch_config.disable_http_cache = args.no_http_cache or (os.getenv("FETCHER_HTTP_CACHE_DISABLE", "0") == "1")
+    if args.no_fanout:
+        fetch_config.enable_toc_fanout = False
+    fetch_config.overrides_path = DEFAULT_POLICY.overrides_path
 
     cache_path = args.cache_path
     output_path = args.output or inventory_path.with_suffix(".results.jsonl")

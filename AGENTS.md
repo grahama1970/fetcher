@@ -20,6 +20,17 @@ module, keep the following in mind:
 5. **Test via uv**: Run `uv run pytest` or targeted scripts. The `.venv` in this repo is Python 3.12.10; match that when
    running local experiments from other projects.
 
+## Agent conversations (memory project)
+- Human triggers:  
+  - `poll:` → run the poll script to fetch action-required messages for this agent.  
+  - `send:` → run the send script with `ID_TO`, `BODY` (and optional `TOPIC`/`PRIORITY`).  
+- Scripts (work from any directory):  
+  - `scripts/agents/poll-conversations.sh` — lists action-required messages (`id_to=<agent>`, default `fetcher`), priority-first.  
+  - `scripts/agents/send-conversation.sh` — send a message. Env: `ID_TO` (required), `BODY` (required), optional `TOPIC`, `PRIORITY`, `ACTION_REQUIRED=true/false`, `ID_FROM` (default `fetcher`).  
+  - `scripts/agents/ack-conversation.sh` — ack after successful handling. Env: `MSG_ID` (`agent_conversations/<key>`), optional `AGENT` (default `fetcher`).  
+- Defaults baked into scripts: `ARANGO_URL=http://127.0.0.1:8529`, `ARANGO_DB=lessons`, `ARANGO_USER=root`, `ARANGO_PASS=openSesame`, `PYTHONPATH` includes `memory/src`. Override via environment if needed.  
+- Behavior: auto-ack on success; leave unacked on failure. Messages expire in ~30 days. Broadcast: `ID_TO=all`; multi-recipient: repeat `ID_TO`.
+
 ## OPERATIONS
 - Required env defaults live in `.env` (safe for local dev, not production secrets).
 - `uv run python -m fetcher.workflows.fetcher --help` exposes the CLI entrypoint when you need to fetch a URL manually.

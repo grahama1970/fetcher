@@ -152,6 +152,7 @@ def generate_outstanding_summary(
             safe_domain,
             policy,
             content_verdict,
+            metadata,
         )
         counts[category] = counts.get(category, 0) + 1
         items.append(
@@ -186,7 +187,9 @@ def _categorize_outstanding(
     safe_domain: bool,
     policy: "FetcherPolicy",
     content_verdict: Optional[str],
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, str]:
+    metadata = metadata or {}
     lower_verdict = (verdict or "").lower()
     content_verdict = (content_verdict or "").lower()
 
@@ -196,11 +199,26 @@ def _categorize_outstanding(
     if status in {500, 502, 503}:
         return "retry", f"HTTP status {status}"
 
+    # Distinguish bot/anti-automation interstitials (e.g., Cloudflare "Just a moment")
+    # from generic login/JS-required pages. These typically present short HTML
+    # with characteristic titles/text and block both plain HTTP and Playwright.
+    if status in {403, 503}:
+        hub_title = (metadata.get("hub_title") or "").lower()
+        excerpt = (metadata.get("content_excerpt") or "").lower()
+        bot_markers = ("just a moment", "cloudflare", "cf-error-details", "cf-challenge")
+        if any(token in hub_title for token in ("just a moment",)) or any(
+            token in excerpt for token in bot_markers
+        ):
+            return "bot_blocked", "Automated access blocked by anti-bot interstitial"
+
     if status in {401, 403} and domain in (SIGNIN_MODAL_DOMAINS | SPA_FALLBACK_DOMAINS):
         return "needs_login_or_playwright", "Requires login or JS rendering"
 
     if lower_verdict in {"likely", "maybe"}:
         return "paywall", f"Paywall verdict {lower_verdict}"
+
+    if content_verdict == "missing_file":
+        return "broken_or_moved", "content_verdict=missing_file"
 
     if content_verdict in {"paywall", "thin", "link_hub", "weak"}:
         reason = "content_verdict=" + content_verdict
@@ -211,6 +229,9 @@ def _categorize_outstanding(
             "weak": "content_weak",
         }
         return mapping.get(content_verdict, "content_issue"), reason
+
+    if content_verdict == "password_protected":
+        return "password_protected", "content_verdict=password_protected"
 
     if safe_domain:
         return "needs_whitelist", "Domain matches safe-domain policy"

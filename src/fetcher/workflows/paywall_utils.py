@@ -13,7 +13,7 @@ from urllib.parse import urlparse, quote
 import requests
 
 from .fetcher_config import BRAVE_ENDPOINT, HDR_ACCEPT, HDR_BRAVE_TOKEN
-from .fetcher_utils import normalize_domain as _normalize_domain
+from .fetcher_utils import has_text_payload, normalize_domain as _normalize_domain
 from .web_fetch import FetchConfig, FetchResult, URLFetcher
 from ..core.keys import (
     K_CONTROLS,
@@ -63,18 +63,25 @@ DEFAULT_OVERRIDE_RULES: List[Dict[str, Any]] = [
 ]
 
 _OVERRIDE_RULES: Optional[List[Dict[str, Any]]] = None
+_OVERRIDE_RULES_PATH: Optional[str] = None
 _PAYWALL_VERDICT_ALLOW = frozenset({"maybe", "likely"})
 _WAYBACK_API = "https://archive.org/wayback/available?url={url}&timestamp="
 
 
 def reload_overrides_cache() -> None:
-    global _OVERRIDE_RULES
+    global _OVERRIDE_RULES, _OVERRIDE_RULES_PATH
     _OVERRIDE_RULES = None
+    _OVERRIDE_RULES_PATH = None
 
 
 def _load_override_rules(overrides_path: Path, allow_reload: bool) -> List[Dict[str, Any]]:
-    global _OVERRIDE_RULES
-    if _OVERRIDE_RULES is not None and not allow_reload:
+    global _OVERRIDE_RULES, _OVERRIDE_RULES_PATH
+    try:
+        key = str(overrides_path.resolve())
+    except Exception:
+        key = str(overrides_path)
+
+    if _OVERRIDE_RULES is not None and (not allow_reload) and (_OVERRIDE_RULES_PATH == key):
         return _OVERRIDE_RULES
     rules: List[Dict[str, Any]] = []
     try:
@@ -85,6 +92,7 @@ def _load_override_rules(overrides_path: Path, allow_reload: bool) -> List[Dict[
     except Exception:
         rules = []
     _OVERRIDE_RULES = rules
+    _OVERRIDE_RULES_PATH = key
     return rules
 
 
@@ -355,7 +363,8 @@ def _direct_override_candidate(entry: Dict[str, Any], policy: "FetcherPolicy") -
                 return target, rule
             local_file = rule.get("target_local_file")
             if isinstance(local_file, str) and local_file:
-                local_path = (policy.local_sources_dir / local_file).resolve()
+                candidate = Path(local_file).expanduser()
+                local_path = candidate.resolve() if candidate.is_absolute() else (policy.local_sources_dir / local_file).resolve()
                 if local_path.exists():
                     return local_path.as_uri(), rule
     except Exception:
@@ -519,8 +528,19 @@ def resolve_paywalled_entries(
 
         is_404 = (status == 404)
         if not is_missing_file:
-            if (status not in policy.paywall_status_codes) and not is_404:
-                continue
+            status_gate = (status in policy.paywall_status_codes) or is_404
+            # Treat "paywall domains + empty payload" as resolver candidates even
+            # when the HTTP status is 200. This covers bot-gated pages that
+            # respond with minimal content.
+            if not status_gate:
+                empty_payload = bool(
+                    result
+                    and (status == 200)
+                    and (domain in policy.paywall_domains)
+                    and (not has_text_payload(result))
+                )
+                if not empty_payload:
+                    continue
             if domain not in policy.paywall_domains:
                 continue
         if not _verdict_allows_resolver(result):

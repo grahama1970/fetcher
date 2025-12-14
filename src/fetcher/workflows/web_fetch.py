@@ -28,6 +28,7 @@ from urllib.parse import urljoin, quote
 import os
 import warnings
 import requests
+from .fetcher_config import OVERRIDES_PATH as DEFAULT_OVERRIDES_PATH
 from .prefilters import evaluate_body_prefilter
 from . import github_utils
 from .extract_utils import extract_content_features
@@ -301,24 +302,73 @@ SIGNIN_MODAL_DOMAINS = {
 def _normalize_url(u: str) -> str:
     """Normalize a URL for cache/dedup purposes.
 
-    - Strip trailing slash (except root)
+    - Avoid rewriting path characters (path-sensitive sites can 404)
     - Lower-case host
     - Remove default ports
     """
     try:
-        u = (u or "").strip()
-        if len(u) > 1 and u.endswith("/"):
-            u = u[:-1]
-        p = urlparse(u)
+        raw = (u or "").strip()
+        p = urlparse(raw)
         host = p.hostname.lower() if p.hostname else None
+        path = p.path or ""
+        if path and any(ch.isspace() for ch in path):
+            path = "".join(path.split())
         netloc = host if host else p.netloc
         # Drop default ports
         if p.port and ((p.scheme == "http" and p.port == 80) or (p.scheme == "https" and p.port == 443)):
             netloc = host or netloc
-        p = p._replace(netloc=netloc)
+        p = p._replace(netloc=netloc, path=path)
         return urlunparse(p)
     except Exception:
-        return u
+        return u or ""
+
+
+_TARGET_LOCAL_OVERRIDE_CACHE: Dict[str, List[Dict[str, Any]]] = {}
+
+
+def _load_target_local_overrides(path: Path) -> List[Dict[str, Any]]:
+    key = str(path.resolve())
+    if key in _TARGET_LOCAL_OVERRIDE_CACHE:
+        return _TARGET_LOCAL_OVERRIDE_CACHE[key]
+    rules: List[Dict[str, Any]] = []
+    try:
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                rules = data
+    except Exception:
+        rules = []
+    _TARGET_LOCAL_OVERRIDE_CACHE[key] = rules
+    return rules
+
+
+def _has_target_local_override(url: str, overrides_path: Optional[Path]) -> bool:
+    """Return True if overrides.json declares a target_local_file for this URL."""
+    env_path = os.getenv("FETCHER_OVERRIDES_PATH")
+    path = Path(env_path) if env_path else (overrides_path or Path(DEFAULT_OVERRIDES_PATH))
+    overrides_path = path
+    rules = _load_target_local_overrides(overrides_path)
+    if not rules:
+        return False
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    for rule in rules:
+        local_file = rule.get("target_local_file")
+        if not local_file:
+            continue
+        domain = str(rule.get("domain") or "").strip().lower()
+        if domain and domain != (parsed.netloc or "").lower():
+            continue
+        path_prefix = str(rule.get("path_prefix") or "").strip()
+        if path_prefix and not (parsed.path or "").startswith(path_prefix):
+            continue
+        substr = str(rule.get("substring") or "").strip()
+        if substr and substr not in url:
+            continue
+        return True
+    return False
 
 def _toggle_trailing_slash(u: str) -> str:
     """Return the same URL with trailing slash toggled.
@@ -338,6 +388,70 @@ def _toggle_trailing_slash(u: str) -> str:
         return urlunparse(p._replace(path=path))
     except Exception:
         return u
+
+def _looks_like_github_pages_404(text: str) -> bool:
+    """Detect the GitHub Pages soft-404 template that (wrongly) returns 200."""
+    if not text:
+        return False
+    lowered = text.lower()
+    return (
+        "page not found \u00b7 github pages" in lowered
+        or "the site configured at this address" in lowered
+        or "does not contain the requested file" in lowered
+    )
+
+
+_SOFT_404_TEMPLATES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    (
+        "github_pages_404",
+        (
+            "page not found \u00b7 github pages",
+            "the site configured at this address",
+            "does not contain the requested file",
+        ),
+    ),
+    (
+        "cloudflare_access_denied",
+        (
+            "cloudflare",
+            "error 1020",
+            "access denied",
+            "you are unable to access",
+        ),
+    ),
+    (
+        "s3_nosuchkey",
+        (
+            "<code>nosuchkey</code>",
+            "<code>nosuchkey",
+            "code>nosuchkey<",
+        ),
+    ),
+    (
+        "generic_not_found",
+        (
+            "page not found",
+            "requested url was not found on this server",
+            "the page you are looking for doesn't exist",
+        ),
+    ),
+)
+
+
+def _detect_soft_404(text: str) -> Optional[str]:
+    """Return a template id when the body matches a known soft-404/blocked page."""
+    if not text:
+        return None
+    lowered = text.lower()
+    for template_id, tokens in _SOFT_404_TEMPLATES:
+        if all(token in lowered for token in tokens):
+            return template_id
+    if _looks_like_github_pages_404(text):
+        return "github_pages_404"
+    # Fallback: single-token generic match for short bodies
+    if "page not found" in lowered and "requested url" in lowered:
+        return "generic_not_found"
+    return None
 
 
 def _split_env_list(value: str, *, lower: bool = False) -> Tuple[str, ...]:
@@ -592,6 +706,10 @@ class FetchConfig:
     local_data_root: Optional[Path] = None
     screenshots_dir: Optional[Path] = None
     proxy_rotation: Optional[ProxyRotationSettings] = None
+    disable_http_cache: bool = False
+    overrides_path: Optional[Path] = None
+    # Controls hub fan-out (Phase 2). When None, fall back to env SPARTA_TOC_FANOUT (default on).
+    enable_toc_fanout: Optional[bool] = None
 
 
 @dataclass
@@ -653,8 +771,10 @@ class URLFetcher:
     ) -> None:
         self.config = config
         self.cache_path = cache_path
+        env_disable_cache = os.getenv("FETCHER_HTTP_CACHE_DISABLE", "0") == "1"
+        self._cache_enabled = not (config.disable_http_cache or env_disable_cache)
         self._cache: Dict[str, Dict[str, Any]] = {}
-        if cache_path and cache_path.exists():
+        if self._cache_enabled and cache_path and cache_path.exists():
             try:
                 self._cache = json.loads(cache_path.read_text(encoding="utf-8"))
             except json.JSONDecodeError:
@@ -662,6 +782,14 @@ class URLFetcher:
         self._cache_dirty = False
         # Guard cache mutations across async tasks sharing the same event loop
         self._cache_lock: asyncio.Lock = asyncio.Lock()
+        # Resolve overrides path: env takes precedence, then config, then default policy path.
+        env_overrides = os.getenv("FETCHER_OVERRIDES_PATH")
+        if env_overrides:
+            self._overrides_path = Path(env_overrides)
+        elif config.overrides_path is not None:
+            self._overrides_path = config.overrides_path
+        else:
+            self._overrides_path = Path(DEFAULT_OVERRIDES_PATH)
         self._local_data_root = (
             Path(config.local_data_root).resolve()
             if config.local_data_root is not None
@@ -742,7 +870,10 @@ class URLFetcher:
 
             # Phase 2 (optional): hub fan-out – fetch child links discovered on link-hub pages
             try:
-                if os.getenv("SPARTA_TOC_FANOUT", "1") == "1":
+                enable_fanout = self.config.enable_toc_fanout
+                if enable_fanout is None:
+                    enable_fanout = os.getenv("SPARTA_TOC_FANOUT", "1") == "1"
+                if enable_fanout:
                     # Build a set of already-requested normalized URLs
                     existing: set[str] = set()
                     for e in unique_entries:
@@ -871,7 +1002,7 @@ class URLFetcher:
                 # Hub fan-out is best-effort; never fail the batch
                 pass
 
-        if self._cache_dirty and self.cache_path:
+        if self._cache_enabled and self._cache_dirty and self.cache_path:
             await self._flush_cache_to_disk()
 
         runtime = max(0.001, time.perf_counter() - start_time)
@@ -880,7 +1011,7 @@ class URLFetcher:
         extra["rate_limit_metrics"] = rate_metrics
         if self._proxy_audit is not None:
             extra["proxy_rotation"] = self._proxy_audit
-        audit = self._build_audit(results, len(unique_entries), extra=extra)
+        audit = _build_audit(results, len(unique_entries), extra=extra)
         return results, audit
 
     async def _flush_cache_to_disk(self) -> None:
@@ -936,7 +1067,19 @@ class URLFetcher:
 
         async with semaphore, domain_sem:
             # Use normalized key for cache; fall back to raw for legacy entries
-            cached = self._cache.get(url_norm) or self._cache.get(url)
+            cached = None
+            if self._cache_enabled:
+                cached = self._cache.get(url_norm) or self._cache.get(url)
+                # Skip cached entries when a target_local_file override exists so mirrors win.
+                try:
+                    if cached and _has_target_local_override(url, self._overrides_path):
+                        cached = None
+                except Exception:
+                    cached = cached
+                # Skip cached d3fend_local entries when local data root is disabled
+                local_root_disabled = (self._local_data_root is None) or (os.getenv("SPARTA_STEP06_DISABLE_LOCAL_DATA_ROOT", "0") == "1") or (os.getenv("FETCHER_DISABLE_LOCAL_DATA_ROOT", "0") == "1")
+                if cached and cached.get("method") == "d3fend_local" and local_root_disabled:
+                    cached = None
             if cached:
                 cache_meta = cached.get("metadata") or {}
                 # Retro-fit link hub analysis for cached HTML if missing
@@ -973,7 +1116,7 @@ class URLFetcher:
                     status, content_type, text, method, extra_metadata, local_bytes = local_result
                     fetched_at = datetime.now(timezone.utc).isoformat()
                     metadata = _ensure_redirect({**base_metadata, **(extra_metadata or {})})
-                    if status == 200 and text:
+                    if self._cache_enabled and status == 200 and text:
                         async with self._cache_lock:
                             self._cache[url_norm] = {
                                 "status": status,
@@ -1058,7 +1201,7 @@ class URLFetcher:
                         extra_metadata = {**extra_metadata, **proxy_extra_metadata}
                     else:
                         extra_metadata.setdefault("proxy_rotation_failed", True)
-                if status == 200 and text:
+                if self._cache_enabled and status == 200 and text:
                     self._cache[url_norm] = {
                         "status": status,
                         "content_type": content_type,
@@ -1440,6 +1583,15 @@ class URLFetcher:
                     body_bytes = original_bytes
                     extra_metadata.setdefault("playwright_failed", True)
                     extra_metadata.setdefault("playwright_error", str(exc))
+            elif needs_playwright and not fallback_allowed:
+                # When a page is JS-heavy but Playwright is unavailable, fall back to
+                # r.jina.ai which performs remote rendering/extraction.
+                extra_metadata.setdefault("playwright_unavailable", True)
+                jina = await self._fetch_from_jina(session, url)
+                if jina is not None:
+                    status, content_type, text, method, jina_meta, jina_bytes = jina
+                    extra_metadata.update(jina_meta)
+                    body_bytes = jina_bytes
             # After we have final HTML text, analyze for link-hub/ToC pages
             try:
                 hub_meta = self._analyze_link_hub(text or "", url)
@@ -1476,6 +1628,15 @@ class URLFetcher:
                 extra_metadata.setdefault("playwright_failed", True)
                 extra_metadata.setdefault("playwright_error", str(exc))
 
+        if status == 200 and "html" in (content_type or "").lower():
+            soft_404_id = _detect_soft_404(text or "")
+            if soft_404_id:
+                extra_metadata["soft_404_detected"] = True
+                extra_metadata["soft_404_template"] = soft_404_id
+                status = 404
+                text = ""
+                body_bytes = None
+
         # Certain providers (e.g., Cloudflare) return 200 with a block page.
         block_tokens = ("cf-error-details", "you are unable to access", "you have been blocked")
         lower_text = (text or "").lower()
@@ -1506,6 +1667,12 @@ class URLFetcher:
                 status, content_type, text, method, gt_meta, gt_bytes = gt
                 extra_metadata.update(gt_meta)
                 body_bytes = gt_bytes
+
+        # Final guard: never return 200 when a soft-404 template was detected.
+        if extra_metadata.get("soft_404_detected") and status == 200:
+            status = 404
+            text = ""
+            body_bytes = None
 
         if status in {404, 410, -1}:
             brave_hint = self._brave_lookup(url)
@@ -1678,7 +1845,8 @@ class URLFetcher:
             "via": "jina",
             "jina_url": jina_url,
         }
-        return 200, "text/html", text, "jina", metadata, body
+        # r.jina.ai returns markdown-like text, not raw HTML.
+        return 200, "text/plain", text, "jina", metadata, body
 
     async def _fetch_from_google_translate(
         self,
@@ -1805,7 +1973,9 @@ class URLFetcher:
         if link_density >= link_density_min:
             reasons.append("high_link_density")
 
-        is_link_hub = len([r for r in reasons if r in {"links_min", "high_link_density"}]) >= 1 and (link_count >= links_min)
+        # A hub should be meaningfully link-heavy relative to body content; don't
+        # treat narrative pages with lots of incidental links as hubs.
+        is_link_hub = bool(link_count >= links_min and (body_text_chars <= body_chars_max or link_density >= link_density_min))
         meta: Dict[str, Any] = {
             "link_hub": bool(is_link_hub),
             "link_hub_reasons": reasons,
@@ -2067,8 +2237,11 @@ class URLFetcher:
         local_path = Path(parsed_url.path)
         if not local_path.is_absolute():
             local_path = Path(parsed_url.netloc + parsed_url.path).resolve()
-        base = self._local_data_root or Path.cwd()
-        if not _is_within(local_path, base):
+        # Default to the file's own parent directory when no explicit base is
+        # provided so absolute file:// URIs outside the current working
+        # directory remain readable (use config.local_data_root to constrain).
+        allowed_roots = [self._local_data_root] if self._local_data_root else [local_path.parent]
+        if not any(_is_within(local_path, root) for root in allowed_roots):
             raise PermissionError(f"Refusing file access outside allowed base: {local_path}")
         if not local_path.exists():
             raise FileNotFoundError(f"Local artifact not found: {local_path}")
@@ -2188,7 +2361,7 @@ class URLFetcher:
         finally:
             doc.close()
 
-def _build_audit(self, results: List[FetchResult], target_total: int, *, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def _build_audit(results: List[FetchResult], target_total: int, *, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         successes = sum(1 for r in results if r.status == 200 and has_text_payload(r))
         failures = sum(1 for r in results if r.status != 200)
         audit = {
