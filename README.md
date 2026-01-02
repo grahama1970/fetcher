@@ -190,6 +190,7 @@ Key behaviors:
 - `--help-full` and `--find <query>` provide discoverability.
 - Missing Brave/Playwright dependencies surface as environment warnings (stderr + summary/audit).
 - `--soft-fail` keeps exit code 0 even when environment warnings are present; otherwise warnings raise a non-zero exit.
+ETL runs (`fetcher-etl`) accept `--soft-fail` to keep exit code 0 when environment warnings are present.
 
 `fetcher-etl` remains the full ETL CLI with all knobs and reports.
 

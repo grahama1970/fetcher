@@ -28,7 +28,7 @@ uv run fetcher --find markdown >/dev/null
 
 echo "[smoke] fetcher get (single url)"
 RUN_DIR="$TMP_DIR/consumer_single"
-uv run fetcher get https://www.nasa.gov --out "$RUN_DIR" >/dev/null
+uv run fetcher get https://www.nasa.gov --out "$RUN_DIR" --soft-fail >/dev/null
 test -f "$RUN_DIR/consumer_summary.json"
 test -f "$RUN_DIR/Walkthrough.md"
 test -d "$RUN_DIR/downloads"
@@ -37,21 +37,21 @@ echo "[smoke] fetcher get-manifest (file)"
 MANIFEST="$TMP_DIR/urls.txt"
 printf "https://www.nasa.gov\nhttps://example.com\n" > "$MANIFEST"
 RUN_DIR="$TMP_DIR/consumer_manifest"
-uv run fetcher get-manifest "$MANIFEST" --out "$RUN_DIR" >/dev/null
+uv run fetcher get-manifest "$MANIFEST" --out "$RUN_DIR" --soft-fail >/dev/null
 test -f "$RUN_DIR/consumer_summary.json"
 test -f "$RUN_DIR/Walkthrough.md"
 test -d "$RUN_DIR/downloads"
 
 echo "[smoke] fetcher get-manifest (stdin)"
 RUN_DIR="$TMP_DIR/consumer_manifest_stdin"
-cat "$MANIFEST" | uv run fetcher get-manifest - --out "$RUN_DIR" >/dev/null
+cat "$MANIFEST" | uv run fetcher get-manifest - --out "$RUN_DIR" --soft-fail >/dev/null
 test -f "$RUN_DIR/consumer_summary.json"
 test -f "$RUN_DIR/Walkthrough.md"
 test -d "$RUN_DIR/downloads"
 
 echo "[smoke] fetcher get --json (stdout only)"
 JSON_OUT="$TMP_DIR/consumer_json.json"
-uv run fetcher get https://example.com --out "$TMP_DIR/consumer_json" --json > "$JSON_OUT"
+uv run fetcher get https://example.com --out "$TMP_DIR/consumer_json" --json --soft-fail > "$JSON_OUT"
 python - "$JSON_OUT" <<'PY'
 import json, sys
 path = sys.argv[1] if len(sys.argv) > 1 else None
@@ -67,7 +67,7 @@ uv run fetcher-etl --help >/dev/null
 
 echo "[smoke] fetcher-etl --url (single url)"
 ETL_OUT="$TMP_DIR/etl_smoke.results.jsonl"
-uv run fetcher-etl --url https://example.com --output "$ETL_OUT" --run-artifacts "$TMP_DIR/etl_artifacts" >/dev/null
+uv run fetcher-etl --url https://example.com --output "$ETL_OUT" --run-artifacts "$TMP_DIR/etl_artifacts" --soft-fail >/dev/null
 test -f "$ETL_OUT"
 
 echo "[smoke] done"

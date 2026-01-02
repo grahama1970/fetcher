@@ -76,6 +76,7 @@ Outputs:
 Use `fetcher-etl` when you need full ETL reports and knobs.
 Missing Brave/Playwright dependencies surface as environment warnings in stderr and the summary/audit.
 Use `--soft-fail` on the consumer CLI to keep exit code 0 when warnings exist.
+ETL (`fetcher-etl`) supports `--soft-fail` for the same behavior.
 
 ## 5. Optional alternates
 Install the extras and set SciLLM env vars:

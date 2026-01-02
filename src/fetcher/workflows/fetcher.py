@@ -563,6 +563,7 @@ def run_fetch_pipeline(
     }
     if env_warnings:
         audit_payload["environment_warnings"] = env_warnings
+        audit_payload["soft_failures"] = [item.get("code") for item in env_warnings if item.get("code")]
     if news_abstract_count:
         audit_payload["news_abstracts"] = news_abstract_count
     if pdf_paywall_mismatches:
@@ -801,6 +802,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--resolver-limit", type=int, default=24, help="Resolver limit per batch")
     parser.add_argument("--no-resolver", action="store_true", help="Disable alternate resolvers")
     parser.add_argument("--no-http-cache", action="store_true", help="Disable HTTP cache read/write for this run")
+    parser.add_argument("--soft-fail", action="store_true", help="Exit 0 even when environment warnings are present")
     parser.add_argument(
         "--no-fanout",
         action="store_true",
@@ -840,12 +842,17 @@ def main(argv: Optional[List[str]] = None) -> int:
             rolling_window_max_windows=args.max_windows,
         )
         payload = result.to_dict()
+        env_warnings = (result.metadata or {}).get("environment_warnings") or []
+        if env_warnings:
+            payload["soft_failures"] = [item.get("code") for item in env_warnings if item.get("code")]
         if args.output:
             args.output.parent.mkdir(parents=True, exist_ok=True)
             with args.output.open("w", encoding="utf-8") as fh:
                 fh.write(result.to_json() + "\n")
         json.dump(payload, sys.stdout, ensure_ascii=False, indent=2)
         sys.stdout.write("\n")
+        if env_warnings and not args.soft_fail:
+            return 3
         return 0
 
     inventory_path: Path = args.inventory
@@ -897,8 +904,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         "audit_path": str(audit_path),
         "run_artifacts_dir": str(run_artifacts_dir),
     }
+    env_warnings = result.audit.get("environment_warnings") or []
+    if env_warnings:
+        summary["environment_warnings"] = env_warnings
+        summary["soft_failures"] = [item.get("code") for item in env_warnings if item.get("code")]
     json.dump(summary, sys.stdout, ensure_ascii=False, indent=2)
     sys.stdout.write("\n")
+    if env_warnings and not args.soft_fail:
+        return 3
     return 0
 
 
