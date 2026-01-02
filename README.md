@@ -189,6 +189,7 @@ Key behaviors:
 - `--json` prints only the summary JSON to stdout (no extra logs).
 - `--help-full` and `--find <query>` provide discoverability.
 - Missing Brave/Playwright dependencies surface as environment warnings (stderr + summary/audit).
+- `--soft-fail` keeps exit code 0 even when environment warnings are present; otherwise warnings raise a non-zero exit.
 
 `fetcher-etl` remains the full ETL CLI with all knobs and reports.
 

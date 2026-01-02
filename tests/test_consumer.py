@@ -33,6 +33,7 @@ def test_render_walkthrough_deterministic():
         "started_at": "2026-01-02T15:30:45Z",
         "finished_at": "2026-01-02T15:31:12Z",
         "duration_ms": 27000,
+        "soft_failures": ["brave_api_key_missing"],
         "counts": {
             "total": 1,
             "downloaded": 1,
@@ -63,4 +64,5 @@ def test_render_walkthrough_deterministic():
     output = _render_walkthrough(summary)
     assert output.startswith("# Walkthrough")
     assert "Run ID: 20260102T153045Z_a1b2c3" in output
+    assert "Soft Failures" in output
     assert "## Item 1" in output

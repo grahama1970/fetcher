@@ -297,6 +297,12 @@ def _render_walkthrough(summary: Dict[str, Any]) -> str:
             if remedy:
                 lines.append(f"  remedy: {remedy}")
         lines.append("")
+    soft_failures = summary.get("soft_failures") or []
+    if soft_failures:
+        lines.append("## Soft Failures")
+        for item in soft_failures:
+            lines.append(f"- {item}")
+        lines.append("")
     lines.append("## Counts")
     lines.append("| metric | value |")
     lines.append("| --- | --- |")
@@ -345,6 +351,7 @@ def run_consumer(
     entries = _build_entries(urls)
 
     env_warnings = collect_environment_warnings()
+    soft_failures = [warning.get("code") for warning in env_warnings if warning.get("code")]
     for warning in env_warnings:
         message = warning.get("message") or warning.get("code") or "environment warning"
         remedy = warning.get("remedy")
@@ -444,6 +451,8 @@ def run_consumer(
     )
     if env_warnings:
         summary["environment_warnings"] = env_warnings
+    if soft_failures:
+        summary["soft_failures"] = soft_failures
 
     summary_path = run_dir / "consumer_summary.json"
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -452,7 +461,7 @@ def run_consumer(
 
     exit_code = 0
     if not soft_fail:
-        if summary["counts"]["failed"] > 0:
+        if summary["counts"]["failed"] > 0 or soft_failures:
             exit_code = 3
 
     return summary, exit_code
