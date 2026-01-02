@@ -79,6 +79,20 @@ Each HTML result also records a `paywall_detection` blob (score, verdict, indica
 
 These files are referenced via `blob_path`/`rolling_windows_path` in `FetchResult.metadata`, giving downstream tools (extractor, MCPs, etc.) a deterministic attachment to hand to format-specific providers.
 
+### HTTP cache defaults
+
+Fetcher now enables the HTTP cache by default so repeated requests for the same URL (with identical normalized paths) reuse the last good snapshot instead of re-downloading HTML every time. Controls:
+
+- `FETCHER_HTTP_CACHE_DIR` (default `run/fetch_cache`) or `FETCHER_HTTP_CACHE_PATH` (explicit file) pick the on-disk cache location.
+- `FETCHER_HTTP_CACHE_DISABLE=1` or CLI `--no-http-cache` turns the feature off for runs that must ignore cached snapshots.
+- `FETCHER_HTTP_CACHE_PATH` can be shared across processes to seed downstream agents; cached rows are skipped automatically when they were produced by deprecated shortcuts (e.g., the removed D3FEND CSV mirror).
+
+Single-URL helpers (`fetcher.workflows.fetcher.fetch_url`) also respect the same environment variables, and every `FetchResult` advertises whether it came from cache via the `from_cache` field.
+
+### Optional PDF discovery
+
+Many reference pages (MITRE D3FEND tactics, ATT&CK summaries, etc.) embed “Download PDF” links that contain richer content than the HTML summary. Set `FETCHER_ENABLE_PDF_DISCOVERY=1` (or pass `--pdf-discovery N` to the CLI) to have fetcher automatically queue up to `FETCHER_PDF_DISCOVERY_MAX` (default 3) PDF links discovered on each HTML page. Auto-fetched PDFs inherit the parent metadata (`parent_url`, `source="pdf_discovery"`, `pdf_discovered=true`), respect the same throttling/proxy rules, and appear alongside the original page in the run artifacts. Leave the flag off to fetch only the URLs you explicitly requested.
+
 ### Optional PDF password cracking
 
 If you need to unlock lightly protected PDFs (short PINs/dictionaries), install the optional helper and enable the env toggle:
@@ -93,6 +107,14 @@ export FETCHER_PDF_CRACK_MAXLEN=6
 ```
 
 Fetcher will attempt a bounded brute-force when `pdf.needs_pass` is detected. Successful cracks proceed with normal extraction; failures are tagged `content_verdict="password_protected"` and skip downstream chunking. When `pdferli` cannot recover a password but the search space is small, `FETCHER_PDF_BRUTE_LIMIT` controls an optional PyMuPDF fallback (default 50 000 combinations).
+
+### Progress logging
+
+Long fetch batches now emit `[fetcher] progress <completed>/<total>: …` lines to stderr so you can confirm the run is alive even when piping through `tee`. Tune the cadence via `FETCHER_PROGRESS_INTERVAL` (default `50`) or disable the logs with `FETCHER_PROGRESS_ENABLE=0`.
+
+```
+FETCHER_PROGRESS_INTERVAL=25 make fetch_sparta_urls
+```
 
 ## Link-hub fan-out
 
@@ -128,6 +150,8 @@ export SPARTA_STEP06_PROXY_HINTS="rate limit,too many requests"
 
 Whenever a throttled response matches the allowlist, Fetcher retries the same URL through the proxy. Proxied rows add `proxy_rotation_*` metadata to each `FetchResult`, and the Step 06 audit JSON inherits a `proxy_rotation` summary (`attempted`, `success`, per-domain breakdown, recent errors) so operators can trace every rotation alongside the existing TOC telemetry.
 
+> Repo default: `.env` ships with an IPRoyal pool from the `memory` project (`SPARTA_STEP06_PROXY_*` + `IPROYAL_*` entries pointing at `geo.iproyal.com:12321`). Update these values locally if your tenant rotates credentials, and keep `IPROYAL_PROXY_LIST=iproyal-proxies.txt` in sync.
+
 ## Run artifacts
 
 Every batch run writes telemetry to `run/artifacts/<run-id>/`, including:
@@ -144,6 +168,28 @@ Every batch run writes telemetry to `run/artifacts/<run-id>/`, including:
 
 For one-off debugging of “raw HTML vs markdown vs what the browser rendered”, use:
 `uv run python scripts/compare_markdown_to_html.py --url <URL> --run-dir run/artifacts/<name>`
+
+## Consumer CLI (best-effort)
+
+The consumer CLI is a simplified, surf-style interface for quick, human-friendly runs.
+It always tries to persist downloads (even when content is junk) and emits only a
+minimal summary + walkthrough by default.
+
+Commands:
+
+```
+fetcher get <url> [--out <DIR>] [--emit <CSV>] [--json] [--soft-fail]
+fetcher get-manifest <urls.txt|-> [--out <DIR>] [--emit <CSV>] [--json] [--soft-fail]
+```
+
+Key behaviors:
+- Always attempts to persist downloads to `downloads/` in the run directory.
+- Uses the same fetch + alternates + Playwright logic as ETL, but with fewer knobs.
+- Writes `<run-dir>/consumer_summary.json` and `<run-dir>/Walkthrough.md`.
+- `--json` prints only the summary JSON to stdout (no extra logs).
+- `--help-full` and `--find <query>` provide discoverability.
+
+`fetcher-etl` remains the full ETL CLI with all knobs and reports.
 
 Audit files now also embed `rate_limit_metrics` (overall runtime, effective RPS, per-domain 429 stats)
 and, when configured, a `proxy_rotation` block so operators can trace throttling and rotation usage

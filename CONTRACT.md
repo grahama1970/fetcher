@@ -51,6 +51,12 @@ automation can reason about the content. Specifically, fetcher MUST:
    - Post-write verification (`verify_blob_content`) re-checks saved bytes and
      updates metadata if corruption is detected.
 
+   Consumer CLI exception:
+   - The consumer runner may persist raw downloads even when
+     `content_verdict != "ok"` to support best-effort inspection. This behavior
+     is consumer-only; ETL pipelines must keep the strict "ok-only" persistence
+     rule.
+
    Derived artifacts (deterministic, opt-in via env/policy):
    - Extracted text: `extracted_text_path` under `run/artifacts/.../extracted_text/`
      (default enabled via `FETCHER_EMIT_EXTRACTED_TEXT=1`).

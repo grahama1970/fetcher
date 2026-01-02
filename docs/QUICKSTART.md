@@ -56,6 +56,25 @@ Notes:
 - Optional: emit LLM-friendly markdown with `FETCHER_EMIT_MARKDOWN=1` (writes `markdown_path` and `run/artifacts/.../markdown/*.md`).
 - Optional: emit pruned “fit markdown” with `FETCHER_EMIT_FIT_MARKDOWN=1` (default) **when markdown is enabled** (writes `fit_markdown_path` and `run/artifacts/.../fit_markdown/*.md`).
 
+### 4b. Consumer CLI (best-effort)
+The consumer CLI provides a minimal, surf-style interface with fewer knobs and
+deterministic outputs. It always attempts to persist downloads, even if content
+is judged junk.
+
+```bash
+fetcher get https://www.nasa.gov
+fetcher get-manifest urls.txt
+fetcher get-manifest - < urls.txt
+fetcher --help-full
+fetcher --find markdown
+```
+
+Outputs:
+- `consumer_summary.json` (stable summary)
+- `Walkthrough.md` (deterministic rendering of the summary)
+
+Use `fetcher-etl` when you need full ETL reports and knobs.
+
 ## 5. Optional alternates
 Install the extras and set SciLLM env vars:
 ```bash

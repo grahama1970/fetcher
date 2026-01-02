@@ -443,6 +443,36 @@ def apply_download_mode(
         result.raw_bytes = None
 
 
+def persist_downloads(
+    results: Iterable[FetchResult],
+    run_artifacts_dir: Path,
+    *,
+    allow_junk: bool = False,
+) -> None:
+    """Persist raw downloads without rolling windows.
+
+    This is a thin wrapper around _persist_blob_for_result for consumer-style
+    runs that always want a download artifact. When allow_junk is False, it
+    mirrors the ETL contract and only persists content_verdict == "ok".
+    """
+
+    run_artifacts_dir.mkdir(parents=True, exist_ok=True)
+    download_dir = run_artifacts_dir / "downloads"
+    download_dir.mkdir(parents=True, exist_ok=True)
+
+    for result in results:
+        if not allow_junk:
+            verdict = (result.metadata or {}).get("content_verdict")
+            if verdict and verdict != "ok":
+                continue
+        blob_path = _persist_blob_for_result(result, download_dir)
+        if blob_path is None:
+            continue
+        metadata = dict(result.metadata or {})
+        metadata["download_mode"] = "download_only"
+        result.metadata = metadata
+
+
 def _read_raw_text_for_extraction(result: FetchResult) -> str:
     """Return the best available raw payload for extraction.
 
@@ -673,6 +703,7 @@ sanity_check()
 __all__ = [
     "annotate_paywall_metadata",
     "apply_download_mode",
+    "persist_downloads",
     "build_rolling_windows",
     "materialize_extracted_text",
     "materialize_markdown",

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 from asyncio.subprocess import PIPE as SUBPROCESS_PIPE
-import csv
 import hashlib
 import itertools
 import re
@@ -16,7 +15,7 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Set
-from urllib.parse import unquote, urlparse, urlunparse
+from urllib.parse import urlparse, urlunparse
 
 import aiohttp
 try:  # Prefer classic fitz alias; fall back to pymupdf if needed
@@ -710,6 +709,8 @@ class FetchConfig:
     overrides_path: Optional[Path] = None
     # Controls hub fan-out (Phase 2). When None, fall back to env SPARTA_TOC_FANOUT (default on).
     enable_toc_fanout: Optional[bool] = None
+    enable_pdf_discovery: bool = False
+    pdf_discovery_max: int = 3
 
 
 @dataclass
@@ -774,11 +775,16 @@ class URLFetcher:
         env_disable_cache = os.getenv("FETCHER_HTTP_CACHE_DISABLE", "0") == "1"
         self._cache_enabled = not (config.disable_http_cache or env_disable_cache)
         self._cache: Dict[str, Dict[str, Any]] = {}
-        if self._cache_enabled and cache_path and cache_path.exists():
+        if self._cache_enabled and cache_path:
             try:
-                self._cache = json.loads(cache_path.read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
-                self._cache = {}
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+            if cache_path.exists():
+                try:
+                    self._cache = json.loads(cache_path.read_text(encoding="utf-8"))
+                except json.JSONDecodeError:
+                    self._cache = {}
         self._cache_dirty = False
         # Guard cache mutations across async tasks sharing the same event loop
         self._cache_lock: asyncio.Lock = asyncio.Lock()
@@ -795,7 +801,6 @@ class URLFetcher:
             if config.local_data_root is not None
             else None
         )
-        self._d3fend_cache: Dict[str, Dict[str, Dict[str, str]]] = {}
         self._insecure_ssl_domains = {domain.lower() for domain in config.insecure_ssl_domains}
         self._proxy_rotation: Optional[ProxyRotationSettings] = config.proxy_rotation or _load_proxy_rotation_from_env()
         self._proxy_audit: Optional[Dict[str, Any]] = None
@@ -887,6 +892,8 @@ class URLFetcher:
                     toc_drop_reasons: Dict[str, int] = {}
                     toc_children_kept = 0
                     toc_children_dropped = 0
+                    pdf_discovery_enqueued = 0
+                    pdf_discovery_kept = 0
                     domain_allowances = _load_domain_allowlist()
                     for r in results:
                         meta = r.metadata or {}
@@ -949,6 +956,31 @@ class URLFetcher:
                             entry = {"url": norm, **inherited}
                             fanout_entries.append(entry)
                             existing.add(norm)
+                    if (
+                        self.config.enable_pdf_discovery
+                        and self.config.pdf_discovery_max > 0
+                    ):
+                        for r in results:
+                            meta = r.metadata or {}
+                            links = meta.get("pdf_discovery_links") or []
+                            if not links:
+                                continue
+                            inherit_keys = {"controls", "titles", "frameworks", "worksheets", "instances", "contexts"}
+                            inherited_pdf: Dict[str, Any] = {k: meta.get(k) for k in inherit_keys if meta.get(k) is not None}
+                            inherited_pdf["parent_url"] = r.url
+                            inherited_pdf["source"] = "pdf_discovery"
+                            inherited_pdf["pdf_discovered"] = True
+                            added = 0
+                            for link in links:
+                                norm = _normalize_url(link)
+                                if not norm or norm in existing:
+                                    continue
+                                fanout_entries.append({"url": norm, **inherited_pdf})
+                                existing.add(norm)
+                                added += 1
+                                if added >= max(1, self.config.pdf_discovery_max):
+                                    break
+                            pdf_discovery_enqueued += added
                     # Fetch fan-out children (bounded by link extractor itself)
                     if fanout_entries:
                         tasks2 = [asyncio.create_task(self._fetch_entry(e, session, semaphore, per_domain)) for e in fanout_entries]
@@ -991,12 +1023,17 @@ class URLFetcher:
                             cr.metadata = md
                             kept_children.append(cr)
                         results.extend(kept_children)
+                        pdf_discovery_kept = sum(
+                            1 for cr in kept_children if (cr.metadata or {}).get("source") == "pdf_discovery"
+                        )
                     # Attach fan-out telemetry to an internal attribute for audit merging
                     self._last_fanout_stats = {
                         "toc_children_kept": toc_children_kept,
                         "toc_children_dropped": toc_children_dropped,
                         "toc_drop_reasons": toc_drop_reasons,
                         "toc_drop_examples": toc_drop_examples,
+                        "pdf_discovery_enqueued": pdf_discovery_enqueued,
+                        "pdf_discovery_kept": pdf_discovery_kept,
                     }
             except Exception:
                 # Hub fan-out is best-effort; never fail the batch
@@ -1016,6 +1053,8 @@ class URLFetcher:
 
     async def _flush_cache_to_disk(self) -> None:
         """Prune the in-memory HTTP cache and persist to disk (bounded)."""
+        if not self.cache_path:
+            return
         async with self._cache_lock:
             try:
                 cap = int(os.getenv("SPARTA_HTTP_CACHE_MAX_ENTRIES", "5000"))
@@ -1077,8 +1116,7 @@ class URLFetcher:
                 except Exception:
                     cached = cached
                 # Skip cached d3fend_local entries when local data root is disabled
-                local_root_disabled = (self._local_data_root is None) or (os.getenv("SPARTA_STEP06_DISABLE_LOCAL_DATA_ROOT", "0") == "1") or (os.getenv("FETCHER_DISABLE_LOCAL_DATA_ROOT", "0") == "1")
-                if cached and cached.get("method") == "d3fend_local" and local_root_disabled:
+                if cached and cached.get("method") == "d3fend_local":
                     cached = None
             if cached:
                 cache_meta = cached.get("metadata") or {}
@@ -1097,6 +1135,7 @@ class URLFetcher:
                 except Exception:
                     pass
                 metadata = _ensure_redirect({**base_metadata, **cache_meta})
+                self._mark_rate_limit_meta(metadata, cached.get("status", 0))
                 return FetchResult(
                     url=url,
                     domain=domain,
@@ -1110,41 +1149,12 @@ class URLFetcher:
                     raw_bytes=None,
                 )
 
-            if domain == "d3fend.mitre.org":
-                local_result = self._fetch_d3fend_local(parsed, base_metadata)
-                if local_result is not None:
-                    status, content_type, text, method, extra_metadata, local_bytes = local_result
-                    fetched_at = datetime.now(timezone.utc).isoformat()
-                    metadata = _ensure_redirect({**base_metadata, **(extra_metadata or {})})
-                    if self._cache_enabled and status == 200 and text:
-                        async with self._cache_lock:
-                            self._cache[url_norm] = {
-                                "status": status,
-                                "content_type": content_type,
-                                "text": text,
-                                "fetched_at": fetched_at,
-                                "method": method,
-                                "metadata": extra_metadata,
-                            }
-                            self._cache_dirty = True
-                    return FetchResult(
-                        url=url,
-                        domain=domain,
-                        status=status,
-                        content_type=content_type,
-                        text=text,
-                        fetched_at=fetched_at,
-                        method=method,
-                        metadata=metadata,
-                        from_cache=False,
-                        raw_bytes=local_bytes,
-                    )
-
             try:
                 if parsed.scheme == "file":
                     status, content_type, text, method, extra_metadata, local_bytes = self._fetch_from_file(parsed)
                     fetched_at = datetime.now(timezone.utc).isoformat()
                     metadata = _ensure_redirect({**base_metadata, **(extra_metadata or {})})
+                    self._mark_rate_limit_meta(metadata, status)
                     return FetchResult(
                         url=url,
                         domain=domain,
@@ -1213,6 +1223,7 @@ class URLFetcher:
                     self._cache_dirty = True
                 error = None
                 metadata = _ensure_redirect({**base_metadata, **(extra_metadata or {})})
+                self._mark_rate_limit_meta(metadata, status)
             except Exception as exc:  # pragma: no cover - runtime failure path
                 status = -1
                 content_type = "error"
@@ -1221,6 +1232,7 @@ class URLFetcher:
                 method = "error"
                 error = str(exc)
                 metadata = _ensure_redirect(dict(base_metadata))
+                self._mark_rate_limit_meta(metadata, status)
                 if status in {404, 410, -1}:
                     hint = self._brave_lookup(url)
                     if hint:
@@ -1272,6 +1284,7 @@ class URLFetcher:
         cache_metadata = {**request.metadata, **(extra_metadata or {})}
         metadata = {**base_metadata, **cache_metadata}
         metadata.setdefault("github_fetch_url", request.fetch_url)
+        self._mark_rate_limit_meta(metadata, status)
         result = FetchResult(
             url=request.original_url,
             domain=urlparse(request.original_url).netloc.lower(),
@@ -1373,6 +1386,14 @@ class URLFetcher:
             "error": error,
         })
 
+    def _mark_rate_limit_meta(self, metadata: Dict[str, Any], status: int) -> None:
+        if status == 429:
+            metadata["rate_limited"] = True
+            metadata["rate_limit_status"] = status
+            metadata.setdefault("rate_limit_timestamp", datetime.now(timezone.utc).isoformat())
+        else:
+            metadata.setdefault("rate_limited", False)
+
     def _proxy_audit_credit(self, domain: str, url: str, trigger: str, detail: str, status: Optional[int] = None) -> None:
         if self._proxy_audit is None:
             return
@@ -1470,6 +1491,7 @@ class URLFetcher:
         proxy_settings: Optional[ProxyRotationSettings] = None,
         proxy_reason: Optional[str] = None,
     ) -> Tuple[int, str, str, str, Dict[str, Any], Optional[bytes]]:
+        final_url: Optional[str] = None
         try:
             ssl_context = None
             if domain in self._insecure_ssl_domains:
@@ -1493,12 +1515,18 @@ class URLFetcher:
                 status = resp.status
                 content_type = resp.headers.get("Content-Type", "text/html").split(";")[0]
                 encoding = (resp.headers.get("Content-Encoding") or "").lower()
+                try:
+                    final_url = str(resp.url)
+                except Exception:
+                    final_url = None
                 raw_bytes = await resp.read()
         except asyncio.TimeoutError:
             raise
 
         method = "aiohttp"
         extra_metadata: Dict[str, Any] = {}
+        if final_url:
+            extra_metadata["final_url"] = final_url
         if self._insecure_ssl_domains and domain in self._insecure_ssl_domains:
             extra_metadata["ssl_verification"] = False
         if proxy_settings is not None:
@@ -1599,6 +1627,16 @@ class URLFetcher:
                     extra_metadata.update(hub_meta)
             except Exception:
                 pass
+            if (
+                self.config.enable_pdf_discovery
+                and self.config.pdf_discovery_max > 0
+                and text
+            ):
+                pdf_links = self._extract_pdf_links(text, url)
+                if pdf_links:
+                    limit = max(self.config.pdf_discovery_max, 32)
+                    extra_metadata["pdf_discovery_links"] = pdf_links[:limit]
+                    extra_metadata["pdf_discovery_total"] = len(pdf_links)
         elif fallback_allowed and not is_pdf and (domain_requires_spa or status in fallback_statuses):
             original_text = text
             original_bytes = body_bytes
@@ -1712,6 +1750,27 @@ class URLFetcher:
             metadata["wget_stderr"] = stderr.decode("utf-8", "ignore")[:500]
         return stdout, metadata
 
+    def _extract_pdf_links(self, html: str, base_url: str) -> List[str]:
+        if not html or not base_url:
+            return []
+        try:
+            soup = BeautifulSoup(html, "lxml")
+        except Exception:
+            return []
+        links: List[str] = []
+        for tag in soup.find_all("a"):
+            href = (tag.get("href") or "").strip()
+            if not href:
+                continue
+            abs_url = urljoin(base_url, href)
+            normalized = _normalize_url(abs_url)
+            if not normalized:
+                continue
+            stripped = normalized.split("#", 1)[0].split("?", 1)[0]
+            if stripped.lower().endswith(".pdf"):
+                links.append(normalized)
+        return links
+
     def _brave_lookup(self, url: str) -> Optional[str]:
         api_key = os.getenv("BRAVE_API_KEY")
         if not api_key:
@@ -1817,6 +1876,7 @@ class URLFetcher:
         metadata = {
             "via": "wayback",
             "wayback_timestamp": timestamp,
+            "final_url": archive_url,
         }
         return 200, content_type, text, "wayback", metadata, body
 
@@ -1844,6 +1904,7 @@ class URLFetcher:
         metadata = {
             "via": "jina",
             "jina_url": jina_url,
+            "final_url": jina_url,
         }
         # r.jina.ai returns markdown-like text, not raw HTML.
         return 200, "text/plain", text, "jina", metadata, body
@@ -1877,6 +1938,7 @@ class URLFetcher:
         metadata = {
             "via": "google_translate",
             "google_translate_url": wrapper,
+            "final_url": wrapper,
         }
         return 200, "text/html", text, "google_translate", metadata, body
 
@@ -1989,94 +2051,6 @@ class URLFetcher:
         }
         return meta
 
-    def _fetch_d3fend_local(
-        self,
-        parsed_url: Any,
-        base_metadata: Dict[str, Any],
-    ) -> Optional[Tuple[int, str, str, str, Dict[str, Any], bytes]]:
-        if self._local_data_root is None:
-            return None
-
-        path = parsed_url.path.strip("/")
-        if not path:
-            return None
-
-        segments = [segment for segment in path.split("/") if segment]
-        if not segments:
-            return None
-
-        dataset = None
-        identifier = None
-
-        if len(segments) >= 3 and segments[0] == "dao" and segments[1] == "artifact":
-            dataset = "d3fend_artifacts.csv"
-            identifier = segments[2]
-        elif len(segments) >= 2 and segments[0] == "technique":
-            dataset = "d3fend_techniques.csv"
-            identifier = segments[1]
-        elif len(segments) >= 2 and segments[0] == "tactic":
-            dataset = "d3fend_tactics.csv"
-            identifier = segments[1]
-
-        if dataset is None or identifier is None:
-            return None
-
-        identifier = unquote(identifier.rstrip("/"))
-        if not identifier:
-            return None
-
-        record = self._lookup_d3fend_record(dataset, identifier)
-        if record is None:
-            return None
-
-        lines: List[str] = []
-        for key, value in record.items():
-            if value is None or value == "":
-                continue
-            if isinstance(value, str) and value.strip() == "nan":
-                continue
-            lines.append(f"{key}: {value}")
-        if not lines:
-            return None
-
-        text = "\n".join(lines) + "\n"
-        metadata = {
-            "d3fend_dataset": dataset,
-            "d3fend_id": identifier,
-            "source": "d3fend_local",
-        }
-        return 200, "text/plain", text, "d3fend_local", metadata, text.encode("utf-8")
-
-    def _lookup_d3fend_record(self, dataset: str, identifier: str) -> Optional[Dict[str, str]]:
-        if dataset not in self._d3fend_cache:
-            catalog = {}
-            data_path = self._local_data_root / "data" / "raw" / dataset
-            if not data_path.exists():
-                self._d3fend_cache[dataset] = catalog
-            else:
-                with data_path.open("r", encoding="utf-8") as csvfile:
-                    reader = csv.DictReader(csvfile)
-                    for row in reader:
-                        normalized_row = {
-                            column: (value or "").strip()
-                            for column, value in row.items()
-                        }
-                        key_candidates = set()
-                        for candidate_key in ("ID", "id", "@id"):
-                            value = normalized_row.get(candidate_key)
-                            if value:
-                                key_candidates.add(value)
-                        url_value = normalized_row.get("URL") or normalized_row.get("Url")
-                        if url_value:
-                            key_candidates.add(url_value)
-                            url_tail = unquote(url_value.rstrip("/").split("/")[-1])
-                            if url_tail:
-                                key_candidates.add(url_tail)
-                        for key in key_candidates:
-                            catalog[key] = normalized_row
-                self._d3fend_cache[dataset] = catalog
-        catalog = self._d3fend_cache.get(dataset) or {}
-        return catalog.get(identifier)
 
     def _needs_playwright(self, url: str, text: str, content_type: str, domain: str) -> bool:
         if not self.config.verify_html:
@@ -2138,6 +2112,7 @@ class URLFetcher:
             dismissed_modal = False
             screenshot_path: Optional[Path] = None
             interstitial_seen = False
+            final_url: Optional[str] = None
             try:
                 response = await page.goto(
                     url,
@@ -2180,6 +2155,10 @@ class URLFetcher:
                     except Exception:
                         screenshot_path = None
                 content = await page.content()
+                try:
+                    final_url = page.url
+                except Exception:
+                    final_url = None
                 status = response.status if response else 0
                 content_type = response.headers.get("content-type", "text/html") if response else "text/html"
             finally:
@@ -2188,6 +2167,8 @@ class URLFetcher:
         metadata: Dict[str, Any] = {"playwright": True}
         if origin_status is not None:
             metadata["fallback_from_status"] = origin_status
+        if final_url:
+            metadata["final_url"] = final_url
         if dismissed_modal:
             metadata["signin_modal_dismissed"] = True
         if screenshot_path is not None:
