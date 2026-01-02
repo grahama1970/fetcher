@@ -63,6 +63,7 @@ from .fetcher_utils import (
     idna_normalize as _idna_normalize,
     normalize_domain as _normalize_domain,
     normalize_set as _normalize_set,
+    collect_environment_warnings,
     resolve_repo_root,
 )
 from .download_utils import (
@@ -478,6 +479,15 @@ def run_fetch_pipeline(
 ) -> FetcherResult:
     """Primary entrypoint used by pipeline scripts."""
 
+    env_warnings = collect_environment_warnings()
+    for warning in env_warnings:
+        message = warning.get("message") or warning.get("code") or "environment warning"
+        remedy = warning.get("remedy")
+        if remedy:
+            print(f"[fetcher] warning: {message} ({remedy})", file=sys.stderr)
+        else:
+            print(f"[fetcher] warning: {message}", file=sys.stderr)
+
     if os.getenv("FETCHER_HTTP_CACHE_DISABLE", "0") == "1":
         fetch_config.disable_http_cache = True
         cache_path = None
@@ -551,6 +561,8 @@ def run_fetch_pipeline(
         "success": success,
         "failed": failed,
     }
+    if env_warnings:
+        audit_payload["environment_warnings"] = env_warnings
     if news_abstract_count:
         audit_payload["news_abstracts"] = news_abstract_count
     if pdf_paywall_mismatches:
@@ -668,6 +680,15 @@ def fetch_url(
 ) -> FetchResult:
     """Fetch a single URL using the shared pipeline defaults."""
 
+    env_warnings = collect_environment_warnings()
+    for warning in env_warnings:
+        message = warning.get("message") or warning.get("code") or "environment warning"
+        remedy = warning.get("remedy")
+        if remedy:
+            print(f"[fetcher] warning: {message} ({remedy})", file=sys.stderr)
+        else:
+            print(f"[fetcher] warning: {message}", file=sys.stderr)
+
     normalized = (url or "").strip()
     if not normalized:
         raise ValueError("url must be a non-empty string")
@@ -716,6 +737,11 @@ def fetch_url(
     )
 
     annotate_paywall_metadata([result], DEFAULT_POLICY)
+
+    if env_warnings:
+        metadata = dict(result.metadata or {})
+        metadata["environment_warnings"] = env_warnings
+        result.metadata = metadata
 
     resolved_mode, resolved_window_size, resolved_window_step, resolved_max_windows = _resolve_download_config(
         download_mode=download_mode,

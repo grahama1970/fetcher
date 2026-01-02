@@ -188,6 +188,7 @@ Key behaviors:
 - Writes `<run-dir>/consumer_summary.json` and `<run-dir>/Walkthrough.md`.
 - `--json` prints only the summary JSON to stdout (no extra logs).
 - `--help-full` and `--find <query>` provide discoverability.
+- Missing Brave/Playwright dependencies surface as environment warnings (stderr + summary/audit).
 
 `fetcher-etl` remains the full ETL CLI with all knobs and reports.
 

@@ -15,6 +15,7 @@ from .core.keys import K_CONTROLS, K_DOMAIN, K_FRAMEWORKS, K_TITLES, K_URL, K_WO
 from .workflows.download_utils import annotate_paywall_metadata, materialize_extracted_text, materialize_markdown, persist_downloads
 from .workflows.extract_utils import evaluate_result_content
 from .workflows.fetcher import DEFAULT_POLICY, _run_in_fetch_loop, _env_bool, _env_int
+from .workflows.fetcher_utils import collect_environment_warnings
 from .workflows.paywall_utils import resolve_paywalled_entries
 from .workflows.web_fetch import FetchConfig, FetchResult, URLFetcher
 
@@ -285,6 +286,17 @@ def _render_walkthrough(summary: Dict[str, Any]) -> str:
     lines.append(f"Finished: {summary.get('finished_at')}")
     lines.append(f"Duration: {summary.get('duration_ms')} ms")
     lines.append("")
+    env_warnings = summary.get("environment_warnings") or []
+    if env_warnings:
+        lines.append("## Environment Warnings")
+        for warning in env_warnings:
+            code = warning.get("code", "warning")
+            message = warning.get("message", "")
+            remedy = warning.get("remedy", "")
+            lines.append(f"- {code}: {message}")
+            if remedy:
+                lines.append(f"  remedy: {remedy}")
+        lines.append("")
     lines.append("## Counts")
     lines.append("| metric | value |")
     lines.append("| --- | --- |")
@@ -331,6 +343,15 @@ def run_consumer(
         raise RuntimeError(f"Unable to create run dir {run_dir}: {exc}") from exc
 
     entries = _build_entries(urls)
+
+    env_warnings = collect_environment_warnings()
+    for warning in env_warnings:
+        message = warning.get("message") or warning.get("code") or "environment warning"
+        remedy = warning.get("remedy")
+        if remedy:
+            print(f"[fetcher] warning: {message} ({remedy})", file=sys.stderr)
+        else:
+            print(f"[fetcher] warning: {message}", file=sys.stderr)
 
     config = FetchConfig()
     config.enable_toc_fanout = False
@@ -421,6 +442,8 @@ def run_consumer(
         emit_fit_md=emit_fit_md,
         fit_md_requested=fit_md_requested,
     )
+    if env_warnings:
+        summary["environment_warnings"] = env_warnings
 
     summary_path = run_dir / "consumer_summary.json"
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

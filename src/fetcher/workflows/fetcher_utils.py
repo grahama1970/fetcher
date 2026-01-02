@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
-from typing import Iterable, List, Set, TYPE_CHECKING
+from typing import Dict, Iterable, List, Set, TYPE_CHECKING
 
 from ..core.keys import K_TEXT_PATH
 
@@ -94,6 +95,39 @@ def has_text_payload(result: "FetchResult | None") -> bool:
     return bool(metadata.get(K_TEXT_PATH))
 
 
+def collect_environment_warnings() -> List[Dict[str, str]]:
+    warnings: List[Dict[str, str]] = []
+    if not (os.getenv("BRAVE_API_KEY") or os.getenv("BRAVE_SEARCH_API_KEY")):
+        warnings.append(
+            {
+                "code": "brave_api_key_missing",
+                "message": "BRAVE_API_KEY is not set; Brave alternates are disabled.",
+                "remedy": "Set BRAVE_API_KEY (or BRAVE_SEARCH_API_KEY) to enable alternate discovery.",
+            }
+        )
+
+    try:
+        from . import web_fetch
+        if getattr(web_fetch, "async_playwright", None) is None:
+            warnings.append(
+                {
+                    "code": "playwright_missing",
+                    "message": "Playwright is not installed; SPA fallback is disabled.",
+                    "remedy": "Install Playwright and run `playwright install --with-deps chromium`.",
+                }
+            )
+    except Exception:
+        warnings.append(
+            {
+                "code": "playwright_missing",
+                "message": "Playwright is not available; SPA fallback is disabled.",
+                "remedy": "Install Playwright and run `playwright install --with-deps chromium`.",
+            }
+        )
+
+    return warnings
+
+
 def sanity_check() -> None:
     assert idna_normalize("ExAmple.COM") == "example.com"
     assert normalize_domain("www.example.com", {"www"}) == "example.com"
@@ -111,5 +145,6 @@ __all__ = [
     "is_safe_domain",
     "resolve_repo_root",
     "has_text_payload",
+    "collect_environment_warnings",
     "sanity_check",
 ]
