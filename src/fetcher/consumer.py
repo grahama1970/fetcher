@@ -14,7 +14,7 @@ from urllib.parse import urlparse
 from .core.keys import K_CONTROLS, K_DOMAIN, K_FRAMEWORKS, K_TITLES, K_URL, K_WORKSHEETS
 from .workflows.download_utils import annotate_paywall_metadata, materialize_extracted_text, materialize_markdown, persist_downloads
 from .workflows.extract_utils import evaluate_result_content
-from .workflows.fetcher import DEFAULT_POLICY, _resolve_cache_path, _run_in_fetch_loop, _env_bool, _env_int
+from .workflows.fetcher import DEFAULT_POLICY, _run_in_fetch_loop, _env_bool, _env_int
 from .workflows.paywall_utils import resolve_paywalled_entries
 from .workflows.web_fetch import FetchConfig, FetchResult, URLFetcher
 
@@ -57,6 +57,16 @@ def resolve_run_dir(out_dir: Optional[Path]) -> Tuple[Path, str]:
     if out_dir:
         return out_dir, run_id
     return Path("run") / "artifacts" / run_id, run_id
+
+
+def resolve_cache_path() -> Optional[Path]:
+    if os.getenv("FETCHER_HTTP_CACHE_DISABLE", "0") == "1":
+        return None
+    env_path = os.getenv("FETCHER_HTTP_CACHE_PATH")
+    if env_path:
+        return Path(env_path)
+    base = Path(os.getenv("FETCHER_HTTP_CACHE_DIR", "run/fetch_cache"))
+    return base / "http_cache.json"
 
 
 def parse_emit_csv(value: str) -> Set[str]:
@@ -337,7 +347,7 @@ def run_consumer(
     if pdf_max_env:
         config.pdf_discovery_max = max(0, _env_int("FETCHER_PDF_DISCOVERY_MAX", config.pdf_discovery_max))
 
-    cache_path = _resolve_cache_path(None)
+    cache_path = resolve_cache_path()
     if config.disable_http_cache:
         cache_path = None
     else:
