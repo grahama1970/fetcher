@@ -13,7 +13,7 @@
 ## Overrides & alternates
 - `data/overrides.json` ships deterministic replacements for brittle vendors (OWASP, MITRE ATLAS, NASA, etc.).
 - Local mirror resolution, path regex routing, and Brave search suggestions share a single audit log.
-- Optional SciLLM JSON-mode workflow (`CHUTES_*` env) generates contextual alternates tied to control metadata.
+- Optional SciLLM JSON-mode workflow (`CHUTES_*` env) generates contextual alternates tied to control metadata. The `fetcher[alternates]` extra is pinned to a specific `scillm` GitHub SHA for reproducibility; update the pin in `pyproject.toml` if you want newer SciLLM behavior (the default branch is `main`).
 
 ## Rate-limit mitigation
 - Step 06 proxy rotation: when `SPARTA_STEP06_PROXY_*` env vars (or `IPROYAL_*` fallbacks) are present, throttled requests to allowlisted domains (default `d3fend.mitre.org`) are automatically retried through the configured rotating proxy before Wayback/Jina.

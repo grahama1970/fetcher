@@ -53,6 +53,7 @@ Update `pyproject.toml` optional dependency:
 - On a clean machine: `uv add "fetcher[alternates]"` succeeds.
 - `python -c "import scillm"` succeeds with extras installed.
 - No runtime behavior changes in fetcher/etl.
+- `fetcher[alternates]` remains pinned to a specific `scillm` GitHub SHA for reproducibility; update the pin in `pyproject.toml` when you want newer SciLLM behavior (default branch is `main`).
 
 ### Tests / smokes
 - Add a minimal installation/import smoke as a script under `scripts/` or as a CI step (no new deps).
