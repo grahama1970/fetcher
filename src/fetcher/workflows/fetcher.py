@@ -158,6 +158,149 @@ def _resolve_download_config(
 _resolve_download_config()
 
 
+def _etl_minimal_help() -> str:
+    return """Fetcher ETL CLI
+
+Usage:
+  fetcher-etl --url <url> [--output <path>] [--audit <path>] [--run-artifacts <dir>]
+  fetcher-etl --inventory <inventory.jsonl> [--output <path>] [--audit <path>] [--run-artifacts <dir>]
+  fetcher-etl --doctor
+
+Common options:
+  --url            Fetch a single URL (prints JSON result).
+  --inventory      JSONL inventory for batch runs.
+  --output         Results JSONL path.
+  --audit          Audit JSON path.
+  --run-artifacts  Directory for artifacts (default: run/artifacts).
+  --soft-fail      Exit 0 even when environment warnings are present.
+  --dry-run        Validate inputs and policy without fetching.
+  --metrics-json   Emit metrics JSON to a path or '-' for stdout.
+  --print-metrics  Print compact metrics summary to stderr.
+
+Discoverability:
+  --help-full     Expanded help, env vars, artifacts.
+  --find <query>  Search flags, env vars, artifacts.
+"""
+
+
+def _etl_help_full() -> str:
+    return """Fetcher ETL CLI (full)
+
+Modes:
+  --url <url>             Fetch a single URL (prints JSON result).
+  --inventory <path>      JSONL inventory for batch runs.
+
+Core flags:
+  --output <path>         Results JSONL path (default: <inventory>.results.jsonl).
+  --audit <path>          Audit JSON path (default: <inventory>.audit.json).
+  --run-artifacts <dir>   Directory for artifacts (default: run/artifacts).
+  --cache-path <path>     Optional HTTP cache path override.
+  --timeout <seconds>     Override request timeout.
+  --concurrency <n>       Max concurrent fetches.
+  --per-domain <n>        Max concurrent fetches per domain.
+  --resolver-limit <n>    Max alternates resolved per batch.
+  --no-resolver           Disable alternate resolvers.
+  --no-http-cache         Disable HTTP cache read/write for this run.
+  --no-fanout             Disable link-hub fan-out.
+
+Download mode:
+  --download-mode <mode>  text | download_only | rolling_extract
+  --window-size <chars>   Rolling window size.
+  --window-step <chars>   Rolling window hop.
+  --max-windows <n>       Maximum rolling windows (0 = unlimited).
+
+Diagnostics:
+  --doctor        Print environment/dependency diagnostics and exit.
+  --dry-run       Validate inputs and policy without fetching.
+
+Metrics:
+  --metrics-json <path|->
+  --print-metrics
+
+Important env vars (existing):
+  BRAVE_API_KEY
+  BRAVE_SEARCH_API_KEY
+  CHUTES_API_BASE
+  CHUTES_API_KEY
+  CHUTES_TEXT_MODEL
+  FETCHER_OVERRIDES_PATH
+  FETCHER_HTTP_CACHE_DISABLE
+  FETCHER_HTTP_CACHE_PATH
+  FETCHER_HTTP_CACHE_DIR
+  FETCHER_DOWNLOAD_MODE
+  FETCHER_ROLLING_WINDOW_SIZE
+  FETCHER_ROLLING_WINDOW_STEP
+  FETCHER_ROLLING_WINDOW_MAX_WINDOWS
+  FETCHER_TEXT_INLINE_MAX_BYTES
+  FETCHER_TEXT_CACHE_DIR
+
+Artifacts:
+  <inventory>.results.jsonl   Fetch results
+  <inventory>.audit.json      Audit + environment warnings
+  run/artifacts/**            Downloads, markdown, outstanding reports, junk table
+  metrics JSON (optional)     When --metrics-json is set
+
+Troubleshooting:
+  - Missing Brave or Playwright deps surface as environment warnings.
+  - Use --dry-run to validate inventory input quickly.
+"""
+
+
+_ETL_FIND_INDEX = [
+    ("command", "url", "Single-URL mode via --url."),
+    ("command", "inventory", "Batch mode via --inventory."),
+    ("flag", "--url", "Fetch a single URL (prints JSON result)."),
+    ("flag", "--inventory", "JSONL inventory for batch runs."),
+    ("flag", "--output", "Results JSONL path."),
+    ("flag", "--audit", "Audit JSON path."),
+    ("flag", "--run-artifacts", "Directory for artifacts."),
+    ("flag", "--cache-path", "Override HTTP cache path."),
+    ("flag", "--timeout", "Override request timeout."),
+    ("flag", "--concurrency", "Max concurrent fetches."),
+    ("flag", "--per-domain", "Max concurrent fetches per domain."),
+    ("flag", "--resolver-limit", "Resolver limit per batch."),
+    ("flag", "--no-resolver", "Disable alternate resolvers."),
+    ("flag", "--no-http-cache", "Disable HTTP cache read/write."),
+    ("flag", "--no-fanout", "Disable link-hub fan-out."),
+    ("flag", "--download-mode", "Override download mode."),
+    ("flag", "--window-size", "Rolling window size."),
+    ("flag", "--window-step", "Rolling window hop."),
+    ("flag", "--max-windows", "Maximum rolling windows."),
+    ("flag", "--metrics-json", "Emit metrics JSON to a path or '-' for stdout."),
+    ("flag", "--print-metrics", "Print compact metrics summary to stderr."),
+    ("flag", "--soft-fail", "Exit 0 even when environment warnings are present."),
+    ("flag", "--doctor", "Print environment diagnostics and exit."),
+    ("flag", "--dry-run", "Validate inputs and policy without fetching."),
+    ("flag", "--help-full", "Expanded help, env vars, artifacts."),
+    ("flag", "--find", "Search flags, env vars, artifacts."),
+    ("env", "BRAVE_API_KEY", "Enable Brave alternates."),
+    ("env", "BRAVE_SEARCH_API_KEY", "Enable Brave alternates."),
+    ("env", "CHUTES_API_BASE", "SciLLM API base."),
+    ("env", "CHUTES_API_KEY", "SciLLM API key."),
+    ("env", "CHUTES_TEXT_MODEL", "SciLLM model."),
+    ("env", "FETCHER_OVERRIDES_PATH", "Override overrides.json path."),
+    ("env", "FETCHER_HTTP_CACHE_DISABLE", "Disable HTTP cache."),
+    ("env", "FETCHER_HTTP_CACHE_PATH", "Override HTTP cache path."),
+    ("env", "FETCHER_DOWNLOAD_MODE", "Default download mode."),
+    ("artifact", "results.jsonl", "Fetch results."),
+    ("artifact", "audit.json", "Audit metadata."),
+    ("artifact", "run/artifacts/", "Downloads, markdown, outstanding reports."),
+    ("artifact", "metrics.json", "Optional metrics output."),
+]
+
+
+def _run_etl_find(query: str) -> str:
+    needle = (query or "").strip().lower()
+    if not needle:
+        return ""
+    lines: List[str] = []
+    for category, name, desc in _ETL_FIND_INDEX:
+        haystack = f"{category} {name} {desc}".lower()
+        if needle in haystack:
+            lines.append(f"{category} {name} - {desc}")
+    return "\n".join(lines)
+
+
 @dataclass(frozen=True, slots=True)
 class Validator:
     concurrency: int = 2
@@ -914,7 +1057,10 @@ def _load_inventory_entries(path: Path) -> List[Dict[str, Any]]:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Fetcher CLI entrypoint")
+    parser = argparse.ArgumentParser(description="Fetcher CLI entrypoint", add_help=False)
+    parser.add_argument("--help", "-h", action="store_true", help="Show minimal help")
+    parser.add_argument("--help-full", action="store_true", help="Show expanded help")
+    parser.add_argument("--find", help="Search flags, env vars, artifacts")
     parser.add_argument("--url", help="Fetch a single URL and print the JSON result")
     parser.add_argument("--inventory", type=Path, help="JSONL inventory for batch runs")
     parser.add_argument("--output", type=Path, help="Destination for fetch results JSONL")
@@ -953,6 +1099,17 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     args = parser.parse_args(argv)
 
+    if args.help_full:
+        sys.stdout.write(_etl_help_full())
+        return 0
+    if args.find is not None:
+        output = _run_etl_find(args.find)
+        if output:
+            sys.stdout.write(output + "\n")
+        return 0
+    if args.help:
+        sys.stdout.write(_etl_minimal_help())
+        return 0
     if args.doctor:
         report = build_doctor_report(overrides_path=DEFAULT_POLICY.overrides_path)
         sys.stdout.write(format_doctor_report(report))

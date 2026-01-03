@@ -40,6 +40,7 @@
 ## Diagnostics
 - `fetcher doctor` (or `fetcher-etl --doctor`) prints environment/dependency checks with redacted values.
 - `--dry-run` validates inputs and policy without fetching.
+- `fetcher-etl --help-full` and `--find <query>` provide surf-style discoverability for the ETL CLI.
 - `docs/smokes/urls.jsonl` ships a small smoke inventory for quick ETL checks.
 
 ## Extensibility hooks

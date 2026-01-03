@@ -212,6 +212,7 @@ without spelunking logs.
 ### Diagnostics & smokes
 - `fetcher doctor` (or `fetcher-etl --doctor`) prints environment/dependency checks with redacted values.
 - `fetcher get --dry-run <url>` or `fetcher-etl --dry-run --inventory <path>` validate inputs without fetching.
+- `fetcher-etl --help`, `fetcher-etl --help-full`, and `fetcher-etl --find <query>` mirror the surf-style discoverability of `fetcher`.
 - A small smoke inventory lives at `docs/smokes/urls.jsonl` for quick ETL checks.
 
 ## Relationship to LiteLLM / SciLLM
