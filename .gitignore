@@ -23,3 +23,6 @@ logs/
 .env
 run/
 docs/fetcher_files/
+archive/
+.uv-cache/
+.ruff_cache/
