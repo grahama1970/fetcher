@@ -802,7 +802,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--resolver-limit", type=int, default=24, help="Resolver limit per batch")
     parser.add_argument("--no-resolver", action="store_true", help="Disable alternate resolvers")
     parser.add_argument("--no-http-cache", action="store_true", help="Disable HTTP cache read/write for this run")
-    parser.add_argument("--soft-fail", action="store_true", help="Exit 0 even when environment warnings are present")
+    parser.add_argument(
+        "--soft-fail",
+        action="store_true",
+        help="Exit 0 even when environment warnings are present (missing Brave/Playwright).",
+    )
     parser.add_argument(
         "--no-fanout",
         action="store_true",
