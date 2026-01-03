@@ -59,12 +59,15 @@ from ..core.keys import (
     K_TEXT_PATH,
 )
 from .fetcher_utils import (
+    build_failure_summary,
     has_text_payload,
     idna_normalize as _idna_normalize,
+    is_safe_domain,
     normalize_domain as _normalize_domain,
     normalize_set as _normalize_set,
     collect_environment_warnings,
     resolve_repo_root,
+    validate_url,
 )
 from .download_utils import (
     annotate_paywall_metadata,
@@ -75,6 +78,7 @@ from .download_utils import (
 )
 from .extract_utils import evaluate_result_content
 from .outstanding_utils import build_outstanding_reports
+from .doctor import build_doctor_report, format_doctor_report
 
 
 # ---------------------------------------------------------------------------
@@ -632,6 +636,7 @@ def run_fetch_pipeline(
     if pdf_paywall_mismatches:
         audit_payload["pdf_paywall_mismatches"] = pdf_paywall_mismatches
         audit_payload["pdf_paywall_mismatches_count"] = len(pdf_paywall_mismatches)
+    audit_payload["failure_summary"] = build_failure_summary(results)
     audit_path.parent.mkdir(parents=True, exist_ok=True)
     audit_path.write_text(json.dumps(audit_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
@@ -664,6 +669,68 @@ def run_fetch_pipeline(
         outstanding_urls=outstanding_urls,
         news_abstracts=news_abstract_count,
     )
+
+
+def _build_dry_run_report(
+    entries: List[Dict[str, Any]],
+    *,
+    policy: FetcherPolicy,
+    inventory_path: Optional[Path],
+    output_path: Optional[Path],
+    audit_path: Optional[Path],
+    run_artifacts_dir: Optional[Path],
+    enable_resolver: bool,
+) -> Dict[str, Any]:
+    invalid_entries: List[Dict[str, str]] = []
+    resolver_domain_candidates = 0
+    safe_domains = 0
+
+    for entry in entries:
+        url = str(entry.get(K_URL, "")).strip()
+        error = validate_url(url)
+        if error:
+            invalid_entries.append({"url": url, "error": error})
+            continue
+        domain = entry.get(K_DOMAIN) or urlparse(url).netloc
+        normalized = _normalize_domain(str(domain or ""), policy.strip_subdomains)
+        if is_safe_domain(
+            normalized,
+            policy.paywall_safe_domains,
+            policy.paywall_safe_suffixes,
+            policy.strip_subdomains,
+        ):
+            safe_domains += 1
+            continue
+        if normalized in policy.paywall_domains and enable_resolver:
+            resolver_domain_candidates += 1
+
+    overrides_path = Path(os.getenv("FETCHER_OVERRIDES_PATH") or policy.overrides_path)
+    report: Dict[str, Any] = {
+        "dry_run": True,
+        "counts": {
+            "total": len(entries),
+            "invalid": len(invalid_entries),
+            "resolver_domain_candidates": resolver_domain_candidates,
+            "safe_domains": safe_domains,
+        },
+        "invalid_entries": invalid_entries,
+        "policy_summary": {
+            "paywall_domains": len(policy.paywall_domains),
+            "paywall_safe_domains": len(policy.paywall_safe_domains),
+            "overrides_path": str(overrides_path),
+            "overrides_exists": overrides_path.exists(),
+            "resolver_enabled": bool(enable_resolver),
+        },
+    }
+    if inventory_path is not None:
+        report["inventory_path"] = str(inventory_path)
+    if output_path is not None:
+        report["output_path"] = str(output_path)
+    if audit_path is not None:
+        report["audit_path"] = str(audit_path)
+    if run_artifacts_dir is not None:
+        report["run_artifacts_dir"] = str(run_artifacts_dir)
+    return report
 
 
 def deterministic_batch_check(
@@ -852,6 +919,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--inventory", type=Path, help="JSONL inventory for batch runs")
     parser.add_argument("--output", type=Path, help="Destination for fetch results JSONL")
     parser.add_argument("--audit", type=Path, help="Path to write audit metadata")
+    parser.add_argument("--doctor", action="store_true", help="Print environment diagnostics and exit")
+    parser.add_argument("--dry-run", action="store_true", help="Validate inputs and policy without fetching")
     parser.add_argument(
         "--run-artifacts",
         type=Path,
@@ -884,12 +953,30 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     args = parser.parse_args(argv)
 
+    if args.doctor:
+        report = build_doctor_report(overrides_path=DEFAULT_POLICY.overrides_path)
+        sys.stdout.write(format_doctor_report(report))
+        return 0 if report.get("ok", True) else 2
+
     if not args.url and not args.inventory:
         parser.error("Either --url or --inventory must be supplied")
     if args.url and args.inventory:
         parser.error("Use either --url or --inventory, not both")
 
     if args.url:
+        if args.dry_run:
+            entries = [{K_URL: args.url}]
+            report = _build_dry_run_report(
+                entries,
+                policy=DEFAULT_POLICY,
+                inventory_path=None,
+                output_path=args.output,
+                audit_path=args.audit,
+                run_artifacts_dir=args.run_artifacts,
+                enable_resolver=not args.no_resolver,
+            )
+            sys.stdout.write(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
+            return 0 if report["counts"]["invalid"] == 0 else 3
         config = FetchConfig()
         if args.timeout:
             config.timeout = args.timeout
@@ -947,6 +1034,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     entries = _load_inventory_entries(inventory_path)
     if not entries:
         parser.error(f"Inventory {inventory_path} did not contain any entries")
+    if args.dry_run:
+        report = _build_dry_run_report(
+            entries,
+            policy=DEFAULT_POLICY,
+            inventory_path=inventory_path,
+            output_path=args.output,
+            audit_path=args.audit,
+            run_artifacts_dir=args.run_artifacts,
+            enable_resolver=not args.no_resolver,
+        )
+        sys.stdout.write(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
+        return 0 if report["counts"]["invalid"] == 0 else 3
 
     fetch_config = FetchConfig()
     if args.timeout:

@@ -37,6 +37,11 @@
 - `outstanding_domains_summary.json` groups unresolved URLs by category, including `paywall`, `content_thin`, `link_hub`, `bot_blocked` (anti-bot interstitials), `password_protected`, `missing_file`, and `needs_login_or_playwright`.
 - Encrypted/password-protected PDFs: when `FETCHER_PDF_CRACK_ENABLE=1` and the optional `pdferli` dependency is installed, fetcher will attempt a bounded brute-force crack (charset/min/max length configurable via env) before extraction; otherwise results are marked `content_verdict="password_protected"` with empty text so downstream chunking/LLM fan-out can deterministically skip them.
 
+## Diagnostics
+- `fetcher doctor` (or `fetcher-etl --doctor`) prints environment/dependency checks with redacted values.
+- `--dry-run` validates inputs and policy without fetching.
+- `docs/smokes/urls.jsonl` ships a small smoke inventory for quick ETL checks.
+
 ## Extensibility hooks
 - Policy injection allows custom paywall hints, alternate providers, or validator tuning.
 - Env vars (`SPARTA_*`, `FETCHER_*`) let Ops teams tweak thresholds without redeploying code.

@@ -13,7 +13,7 @@ from .core.keys import K_CONTROLS, K_DOMAIN, K_FRAMEWORKS, K_TITLES, K_URL, K_WO
 from .workflows.download_utils import annotate_paywall_metadata, materialize_extracted_text, materialize_markdown, persist_downloads
 from .workflows.extract_utils import evaluate_result_content
 from .workflows.fetcher import DEFAULT_POLICY, _run_in_fetch_loop, _env_bool, _env_int
-from .workflows.fetcher_utils import collect_environment_warnings
+from .workflows.fetcher_utils import build_failure_summary, collect_environment_warnings, validate_url
 from .workflows.web_fetch import FetchConfig, FetchResult, URLFetcher
 
 CONSUMER_ID_KEY = "consumer_id"
@@ -280,8 +280,73 @@ def _build_consumer_summary(
             "used_playwright": used_playwright,
             "used_alternates": used_alternates,
         },
+        "failure_summary": build_failure_summary(results_for_items),
         "items": items,
     }
+    return summary
+
+
+def _validate_out_dir(out_dir: Optional[Path]) -> Optional[str]:
+    if out_dir is None:
+        return None
+    try:
+        if out_dir.exists() and not out_dir.is_dir():
+            return "out_dir_not_directory"
+        parent = out_dir if out_dir.exists() else out_dir.parent
+        if not parent.exists():
+            return "out_dir_parent_missing"
+        if not os.access(parent, os.W_OK):
+            return "out_dir_not_writable"
+    except Exception:
+        return "out_dir_unavailable"
+    return None
+
+
+def _build_dry_run_summary(
+    command: str,
+    started_at: datetime,
+    finished_at: datetime,
+    urls: Sequence[str],
+    out_dir: Optional[Path],
+    env_warnings: List[Dict[str, str]],
+) -> Dict[str, Any]:
+    invalid: List[Dict[str, str]] = []
+    items: List[Dict[str, Any]] = []
+    for url in urls:
+        error = validate_url(url)
+        item = {
+            "url": url,
+            "status": "ok" if error is None else "invalid",
+        }
+        if error:
+            item["error"] = error
+            invalid.append({"url": url, "error": error})
+        items.append(item)
+    out_dir_error = _validate_out_dir(out_dir)
+    summary: Dict[str, Any] = {
+        "command": command,
+        "dry_run": True,
+        "started_at": started_at.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "finished_at": finished_at.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "duration_ms": int((finished_at - started_at).total_seconds() * 1000),
+        "counts": {
+            "total": len(urls),
+            "valid": len(urls) - len(invalid),
+            "invalid": len(invalid),
+        },
+        "items": items,
+    }
+    if out_dir is not None:
+        summary["out_dir_check"] = {
+            "path": str(out_dir),
+            "status": "ok" if out_dir_error is None else "error",
+            "error": out_dir_error,
+        }
+    if invalid:
+        summary["invalid_urls"] = invalid
+    if env_warnings:
+        summary["environment_warnings"] = env_warnings
+        summary["soft_failures"] = [warning.get("code") for warning in env_warnings if warning.get("code")]
     return summary
 
 
@@ -318,6 +383,24 @@ def _render_walkthrough(summary: Dict[str, Any]) -> str:
     for key in ("total", "downloaded", "ok", "failed", "used_playwright", "used_alternates"):
         lines.append(f"| {key} | {counts.get(key, 0)} |")
     lines.append("")
+
+    failure_summary = summary.get("failure_summary") or {}
+    if failure_summary:
+        lines.append("## Failure Summary")
+        for label, table_key in (
+            ("Status", "status_counts"),
+            ("Content Verdict", "content_verdict_counts"),
+            ("Fallback Reason", "fallback_reason_counts"),
+        ):
+            rows = failure_summary.get(table_key) or {}
+            if not rows:
+                continue
+            lines.append(f"### {label}")
+            lines.append("| key | count |")
+            lines.append("| --- | --- |")
+            for key in sorted(rows):
+                lines.append(f"| {key} | {rows[key]} |")
+            lines.append("")
 
     for idx, item in enumerate(summary.get("items") or [], start=1):
         lines.append(f"## Item {idx}")
@@ -449,4 +532,30 @@ def run_consumer(
         if summary["counts"]["failed"] > 0 or soft_failures:
             exit_code = 3
 
+    return summary, exit_code
+
+
+def run_consumer_dry_run(
+    urls: Sequence[str],
+    *,
+    command: str,
+    out_dir: Optional[Path],
+    soft_fail: bool,
+) -> Tuple[Dict[str, Any], int]:
+    started_at = datetime.now(timezone.utc)
+    env_warnings = collect_environment_warnings()
+    for warning in env_warnings:
+        message = warning.get("message") or warning.get("code") or "environment warning"
+        remedy = warning.get("remedy")
+        if remedy:
+            print(f"[fetcher] warning: {message} ({remedy})", file=sys.stderr)
+        else:
+            print(f"[fetcher] warning: {message}", file=sys.stderr)
+
+    finished_at = datetime.now(timezone.utc)
+    summary = _build_dry_run_summary(command, started_at, finished_at, urls, out_dir, env_warnings)
+    exit_code = 0
+    if not soft_fail:
+        if summary["counts"]["invalid"] > 0 or summary.get("soft_failures"):
+            exit_code = 3
     return summary, exit_code

@@ -7,7 +7,7 @@ import pytest
 
 from fetcher.workflows import fetcher, paywall_detector, paywall_utils
 from fetcher.workflows.fetcher import _annotate_content_changes, _write_change_feed
-from fetcher.workflows.fetcher_utils import resolve_repo_root
+from fetcher.workflows.fetcher_utils import build_failure_summary, resolve_repo_root, validate_url
 from fetcher.workflows.download_utils import (
     apply_download_mode,
     maybe_externalize_text,
@@ -504,7 +504,7 @@ async def test_github_pages_404_marks_result_failure(monkeypatch) -> None:
     monkeypatch.setattr("fetcher.workflows.web_fetch.async_playwright", None)
     fetcher = URLFetcher(FetchConfig())
     fetcher._local_data_root = None  # force network path, no local dataset shortcut
-    monkeypatch.setattr(fetcher, "_fetch_d3fend_local", lambda *args, **kwargs: None)
+    monkeypatch.setattr(fetcher, "_fetch_d3fend_local", lambda *args, **kwargs: None, raising=False)
 
     class _StubResponse:
         def __init__(self, body: str):
@@ -828,3 +828,40 @@ def test_validate_candidate_url_accepts_external_file(tmp_path: Path) -> None:
     assert result.method == "file"
     assert result.text == "override content"
     assert result.metadata.get("local_path") == str(local_file)
+
+
+def test_validate_url_rejects_invalid() -> None:
+    assert validate_url("https://example.com") is None
+    assert validate_url("http://") == "missing_host"
+    assert validate_url("ftp://example.com") == "unsupported_scheme"
+    assert validate_url("file://") == "missing_path"
+
+
+def test_build_failure_summary_counts() -> None:
+    ok = FetchResult(
+        url="https://example.com/ok",
+        domain="example.com",
+        status=200,
+        content_type="text/html",
+        text="ok",
+        fetched_at="now",
+        method="aiohttp",
+        metadata={"content_verdict": "ok", "fallback_reason": "none"},
+    )
+    fail = FetchResult(
+        url="https://example.com/fail",
+        domain="example.com",
+        status=404,
+        content_type="text/html",
+        text="",
+        fetched_at="now",
+        method="aiohttp",
+        metadata={"content_verdict": "junk", "fallback_reason": "soft_404"},
+    )
+    summary = build_failure_summary([ok, fail])
+    assert summary["status_counts"]["200"] == 1
+    assert summary["status_counts"]["404"] == 1
+    assert summary["content_verdict_counts"]["ok"] == 1
+    assert summary["content_verdict_counts"]["junk"] == 1
+    assert summary["fallback_reason_counts"]["none"] == 1
+    assert summary["fallback_reason_counts"]["soft_404"] == 1

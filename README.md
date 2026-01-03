@@ -187,6 +187,7 @@ Key behaviors:
 - Uses the same fetch + alternates + Playwright logic as ETL, but with fewer knobs.
 - Writes `<run-dir>/consumer_summary.json` and `<run-dir>/Walkthrough.md`.
 - `--json` prints only the summary JSON to stdout (no extra logs).
+- `--dry-run` validates inputs + environment without fetching.
 - `--help-full` and `--find <query>` provide discoverability.
 - Missing Brave/Playwright dependencies surface as environment warnings (stderr + summary/audit).
 - `--soft-fail` keeps exit code 0 even when environment warnings are present; otherwise warnings raise a non-zero exit.
@@ -207,6 +208,11 @@ fetcher-etl --inventory urls.jsonl --metrics-json - --print-metrics
 Audit files now also embed `rate_limit_metrics` (overall runtime, effective RPS, per-domain 429 stats)
 and, when configured, a `proxy_rotation` block so operators can trace throttling and rotation usage
 without spelunking logs.
+
+### Diagnostics & smokes
+- `fetcher doctor` (or `fetcher-etl --doctor`) prints environment/dependency checks with redacted values.
+- `fetcher get --dry-run <url>` or `fetcher-etl --dry-run --inventory <path>` validate inputs without fetching.
+- A small smoke inventory lives at `docs/smokes/urls.jsonl` for quick ETL checks.
 
 ## Relationship to LiteLLM / SciLLM
 

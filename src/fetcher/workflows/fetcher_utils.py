@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Dict, Iterable, List, Set, TYPE_CHECKING
+from typing import Dict, Iterable, List, Optional, Set, TYPE_CHECKING
+from urllib.parse import urlparse
 
 from ..core.keys import K_TEXT_PATH
 
@@ -95,6 +96,44 @@ def has_text_payload(result: "FetchResult | None") -> bool:
     return bool(metadata.get(K_TEXT_PATH))
 
 
+def validate_url(url: str) -> Optional[str]:
+    raw = (url or "").strip()
+    if not raw:
+        return "missing_url"
+    parsed = urlparse(raw)
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in {"http", "https", "file"}:
+        return "unsupported_scheme"
+    if scheme in {"http", "https"} and not parsed.netloc:
+        return "missing_host"
+    if scheme == "file" and not parsed.path:
+        return "missing_path"
+    return None
+
+
+def build_failure_summary(results: Iterable["FetchResult"]) -> Dict[str, Dict[str, int]]:
+    status_counts: Dict[str, int] = {}
+    content_verdict_counts: Dict[str, int] = {}
+    fallback_reason_counts: Dict[str, int] = {}
+
+    for result in results:
+        status = str(getattr(result, "status", "unknown"))
+        status_counts[status] = status_counts.get(status, 0) + 1
+
+        metadata = getattr(result, "metadata", None) or {}
+        content_verdict = (metadata.get("content_verdict") or "unknown").strip().lower()
+        content_verdict_counts[content_verdict] = content_verdict_counts.get(content_verdict, 0) + 1
+
+        fallback_reason = (metadata.get("fallback_reason") or "none").strip().lower()
+        fallback_reason_counts[fallback_reason] = fallback_reason_counts.get(fallback_reason, 0) + 1
+
+    return {
+        "status_counts": dict(sorted(status_counts.items())),
+        "content_verdict_counts": dict(sorted(content_verdict_counts.items())),
+        "fallback_reason_counts": dict(sorted(fallback_reason_counts.items())),
+    }
+
+
 def collect_environment_warnings() -> List[Dict[str, str]]:
     warnings: List[Dict[str, str]] = []
     if not (os.getenv("BRAVE_API_KEY") or os.getenv("BRAVE_SEARCH_API_KEY")):
@@ -145,6 +184,8 @@ __all__ = [
     "is_safe_domain",
     "resolve_repo_root",
     "has_text_payload",
+    "validate_url",
+    "build_failure_summary",
     "collect_environment_warnings",
     "sanity_check",
 ]

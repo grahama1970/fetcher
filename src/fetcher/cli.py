@@ -7,7 +7,8 @@ from typing import Optional, Set
 
 import typer
 
-from .consumer import load_manifest, parse_emit_csv, run_consumer
+from .consumer import load_manifest, parse_emit_csv, run_consumer, run_consumer_dry_run
+from .workflows.doctor import build_doctor_report, format_doctor_report
 
 app = typer.Typer(add_help_option=False, no_args_is_help=False)
 
@@ -16,18 +17,21 @@ def _minimal_help() -> str:
     return """Fetcher (consumer CLI)
 
 Usage:
-  fetcher get <url> [--out <DIR>] [--emit <CSV>] [--json] [--soft-fail]
-  fetcher get-manifest <urls.txt|-> [--out <DIR>] [--emit <CSV>] [--json] [--soft-fail]
+  fetcher get <url> [--out <DIR>] [--emit <CSV>] [--json] [--soft-fail] [--dry-run]
+  fetcher get-manifest <urls.txt|-> [--out <DIR>] [--emit <CSV>] [--json] [--soft-fail] [--dry-run]
+  fetcher doctor
 
 Common options:
   --out <DIR>     Write artifacts into this directory (no subdir).
   --emit <CSV>    Emit outputs: download,text,md,fit_md (default: download,text,md).
   --json          Print consumer_summary.json to stdout only.
   --soft-fail     Exit 0 even if some items fail.
+  --dry-run       Validate inputs and environment without fetching.
 
 Discoverability:
   --help-full     Expanded help + env vars + artifacts.
   --find <query>  Search commands, flags, env vars, artifacts.
+  --doctor        Run environment diagnostics and exit.
 """
 
 
@@ -37,6 +41,7 @@ def _help_full() -> str:
 Commands:
   get            Fetch a single URL.
   get-manifest   Fetch URLs from a strict line-based manifest (file or stdin).
+  doctor         Print environment and dependency diagnostics.
 
 Emit toggles (--emit CSV):
   download  Persist raw bytes (default ON).
@@ -65,6 +70,7 @@ Important env vars (existing):
 
 Troubleshooting:
   - If Playwright isn’t installed, browser fallbacks are skipped.
+  - Use --dry-run to validate inputs and environment without fetching.
   - Use fetcher-etl for full ETL reports and knobs.
 """
 
@@ -72,12 +78,15 @@ Troubleshooting:
 _FIND_INDEX = [
     ("command", "get", "Fetch a single URL."),
     ("command", "get-manifest", "Fetch URLs from a manifest file or stdin."),
+    ("command", "doctor", "Print environment and dependency diagnostics."),
     ("flag", "--out", "Write artifacts into this directory (no subdir)."),
     ("flag", "--emit", "Emit outputs: download,text,md,fit_md."),
     ("flag", "--json", "Print summary JSON to stdout only."),
     ("flag", "--soft-fail", "Exit 0 even if some items fail."),
+    ("flag", "--dry-run", "Validate inputs and environment without fetching."),
     ("flag", "--help-full", "Expanded help, env vars, artifacts."),
     ("flag", "--find", "Search commands, flags, env vars, artifacts."),
+    ("flag", "--doctor", "Run environment diagnostics and exit."),
     ("env", "BRAVE_API_KEY", "Enable Brave alternates."),
     ("env", "FETCHER_HTTP_CACHE_DISABLE", "Disable HTTP cache read/write."),
     ("env", "FETCHER_HTTP_CACHE_PATH", "Override HTTP cache path."),
@@ -120,6 +129,7 @@ def main(
     help: bool = typer.Option(False, "--help", "-h", is_eager=True, help="Show minimal help."),
     help_full: bool = typer.Option(False, "--help-full", is_eager=True, help="Show expanded help."),
     find: Optional[str] = typer.Option(None, "--find", is_eager=True, help="Search commands, flags, env vars, artifacts."),
+    doctor: bool = typer.Option(False, "--doctor", is_eager=True, help="Run environment diagnostics and exit."),
 ) -> None:
     if help_full:
         typer.echo(_help_full())
@@ -129,9 +139,21 @@ def main(
         if output:
             typer.echo(output)
         raise typer.Exit(code=0)
+    if doctor:
+        report = build_doctor_report()
+        typer.echo(format_doctor_report(report))
+        raise typer.Exit(code=0 if report.get("ok", True) else 2)
     if help or ctx.invoked_subcommand is None:
         typer.echo(_minimal_help())
         raise typer.Exit(code=0)
+
+
+@app.command("doctor", add_help_option=True)
+def doctor_cmd() -> None:
+    """Print environment and dependency diagnostics."""
+    report = build_doctor_report()
+    typer.echo(format_doctor_report(report))
+    raise typer.Exit(code=0 if report.get("ok", True) else 2)
 
 
 @app.command("get", add_help_option=True)
@@ -141,16 +163,25 @@ def get_url(
     emit: str = typer.Option("download,text,md", "--emit", help="Emit outputs: download,text,md,fit_md."),
     json_out: bool = typer.Option(False, "--json", help="Print summary JSON to stdout only."),
     soft_fail: bool = typer.Option(False, "--soft-fail", help="Exit 0 even if some items fail."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Validate inputs and environment without fetching."),
 ) -> None:
     emit_set = _parse_emit(emit)
     try:
-        summary, exit_code = run_consumer(
-            [url],
-            command="get",
-            out_dir=out,
-            emit=emit_set,
-            soft_fail=soft_fail,
-        )
+        if dry_run:
+            summary, exit_code = run_consumer_dry_run(
+                [url],
+                command="get",
+                out_dir=out,
+                soft_fail=soft_fail,
+            )
+        else:
+            summary, exit_code = run_consumer(
+                [url],
+                command="get",
+                out_dir=out,
+                emit=emit_set,
+                soft_fail=soft_fail,
+            )
     except Exception as exc:
         if not json_out:
             typer.echo(f"fatal: {exc}", err=True)
@@ -167,6 +198,7 @@ def get_manifest(
     emit: str = typer.Option("download,text,md", "--emit", help="Emit outputs: download,text,md,fit_md."),
     json_out: bool = typer.Option(False, "--json", help="Print summary JSON to stdout only."),
     soft_fail: bool = typer.Option(False, "--soft-fail", help="Exit 0 even if some items fail."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Validate inputs and environment without fetching."),
 ) -> None:
     emit_set = _parse_emit(emit)
     try:
@@ -176,13 +208,21 @@ def get_manifest(
             typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2)
     try:
-        summary, exit_code = run_consumer(
-            urls,
-            command="get-manifest",
-            out_dir=out,
-            emit=emit_set,
-            soft_fail=soft_fail,
-        )
+        if dry_run:
+            summary, exit_code = run_consumer_dry_run(
+                urls,
+                command="get-manifest",
+                out_dir=out,
+                soft_fail=soft_fail,
+            )
+        else:
+            summary, exit_code = run_consumer(
+                urls,
+                command="get-manifest",
+                out_dir=out,
+                emit=emit_set,
+                soft_fail=soft_fail,
+            )
     except Exception as exc:
         if not json_out:
             typer.echo(f"fatal: {exc}", err=True)
@@ -190,4 +230,3 @@ def get_manifest(
     if json_out:
         sys.stdout.write(json.dumps(summary, ensure_ascii=False) + "\n")
     raise typer.Exit(code=exit_code)
-

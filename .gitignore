@@ -3,6 +3,8 @@ __pycache__/
 *.log
 *.sqlite3
 *.jsonl
+!docs/smokes/
+!docs/smokes/urls.jsonl
 .mypy_cache/
 .pytest_cache/
 ruff_cache/

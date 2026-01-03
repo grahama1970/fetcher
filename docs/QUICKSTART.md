@@ -29,6 +29,15 @@ CHUTES_TEXT_MODEL=chutes/gpt-4o
 ```
 If you skip SciLLM alternates you can leave the `CHUTES_*` values blank.
 
+## 3b. Doctor + dry-run (recommended)
+Validate your environment and inputs before running larger jobs:
+```bash
+fetcher doctor
+fetcher get --dry-run https://example.com
+fetcher-etl --dry-run --inventory docs/smokes/urls.jsonl
+```
+`fetcher doctor` prints a redacted environment report, while `--dry-run` validates inputs and policy without fetching. The smoke inventory contains a small set of stable URLs (HTML, PDF, GitHub blob, 404) for quick ETL checks.
+
 ## 4. Run your first fetch
 ```bash
 uv run python - <<'PY'
