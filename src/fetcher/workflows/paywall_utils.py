@@ -392,7 +392,8 @@ def _search_brave_for_alternates(
     for original_url, (_idx, entry) in targets:
         control_id = (entry.get(K_CONTROLS) or [original_url])[0]
         context = control_contexts.get(control_id, {})
-        query_parts = [context.get("title") or entry.get(K_TITLES, [""])[0]]
+        titles = entry.get(K_TITLES) or [""]
+        query_parts = [context.get("title") or titles[0]]
         definition = context.get("definition") or ""
         if definition:
             query_parts.append(definition[:160])

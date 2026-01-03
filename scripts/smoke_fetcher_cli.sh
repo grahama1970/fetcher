@@ -6,6 +6,7 @@ cd "$ROOT_DIR"
 
 KEEP="${KEEP:-0}"
 TMP_DIR="$(mktemp -d -t fetcher-smoke-XXXXXX)"
+PAYWALL_URL="${PAYWALL_URL:-https://hbr.org/}"
 cleanup() {
   if [ "$KEEP" != "1" ]; then
     rm -rf "$TMP_DIR"
@@ -69,5 +70,10 @@ echo "[smoke] fetcher-etl --url (single url)"
 ETL_OUT="$TMP_DIR/etl_smoke.results.jsonl"
 uv run fetcher-etl --url https://example.com --output "$ETL_OUT" --run-artifacts "$TMP_DIR/etl_artifacts" --soft-fail >/dev/null
 test -f "$ETL_OUT"
+
+echo "[smoke] fetcher get (paywall url)"
+RUN_DIR="$TMP_DIR/consumer_paywall"
+uv run fetcher get "$PAYWALL_URL" --out "$RUN_DIR" --soft-fail >/dev/null
+test -f "$RUN_DIR/consumer_summary.json"
 
 echo "[smoke] done"
