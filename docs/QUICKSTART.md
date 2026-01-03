@@ -92,6 +92,7 @@ Install the extras and set SciLLM env vars:
 uv add "fetcher[alternates]"
 uv run python -m fetcher.workflows.fetcher --use-alternates inventory.jsonl
 ```
+Note: the `alternates` extra is pinned to a specific `scillm` GitHub SHA for reproducibility. Update the pin in `pyproject.toml` if you want newer SciLLM behavior (the default branch is `main`).
 
 ## 6. Download modes (optional)
 Decide how you want bodies stored before running large jobs:

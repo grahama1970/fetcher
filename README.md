@@ -210,7 +210,7 @@ without spelunking logs.
 
 ## Relationship to LiteLLM / SciLLM
 
-The code lives here to make experimentation easier, but nothing prevents you from installing both `scillm` and `fetcher` in the same virtual environment. When the optional `alternates` extra is installed the package will automatically enable SciLLM + Brave resolution just like the router.
+The code lives here to make experimentation easier, but nothing prevents you from installing both `scillm` and `fetcher` in the same virtual environment. When the optional `alternates` extra is installed the package will automatically enable SciLLM + Brave resolution just like the router. The `alternates` extra is pinned to a specific `scillm` GitHub SHA for reproducibility; update the pin in `pyproject.toml` if you want newer SciLLM behavior (the default branch is `main`).
 
 ### Using it from other repos
 
