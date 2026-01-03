@@ -38,7 +38,7 @@ rolling = [
   "spacy>=3.7,<4",
 ]
 alternates = [
-  "litellm @ git+https://github.com/grahama1970/scillm.git@2441c669876c1792bc8ea9154c04b06bc536c9c5",
+  "scillm @ git+https://github.com/grahama1970/scillm.git@fe0d21112b491822bb620d047d8a3df868d07fad",
 ]
 dev = [
   "pytest>=8.3",
