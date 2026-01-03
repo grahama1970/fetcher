@@ -164,14 +164,17 @@ def _etl_minimal_help() -> str:
 Usage:
   fetcher-etl --url <url> [--output <path>] [--audit <path>] [--run-artifacts <dir>]
   fetcher-etl --inventory <inventory.jsonl> [--output <path>] [--audit <path>] [--run-artifacts <dir>]
+  fetcher-etl --manifest <urls.txt|-> [--output <path>] [--audit <path>] [--run-artifacts <dir>]
   fetcher-etl --doctor
 
 Common options:
   --url            Fetch a single URL (prints JSON result).
   --inventory      JSONL inventory for batch runs.
+  --manifest       Line-based URL manifest (one URL per line).
   --output         Results JSONL path.
   --audit          Audit JSON path.
   --run-artifacts  Directory for artifacts (default: run/artifacts).
+  --out            Alias for --run-artifacts.
   --soft-fail      Exit 0 even when environment warnings are present.
   --dry-run        Validate inputs and policy without fetching.
   --metrics-json   Emit metrics JSON to a path or '-' for stdout.
@@ -189,11 +192,13 @@ def _etl_help_full() -> str:
 Modes:
   --url <url>             Fetch a single URL (prints JSON result).
   --inventory <path>      JSONL inventory for batch runs.
+  --manifest <path|->     Line-based manifest (one URL per line).
 
 Core flags:
   --output <path>         Results JSONL path (default: <inventory>.results.jsonl).
   --audit <path>          Audit JSON path (default: <inventory>.audit.json).
   --run-artifacts <dir>   Directory for artifacts (default: run/artifacts).
+  --out <dir>             Alias for --run-artifacts.
   --cache-path <path>     Optional HTTP cache path override.
   --timeout <seconds>     Override request timeout.
   --concurrency <n>       Max concurrent fetches.
@@ -249,11 +254,14 @@ Troubleshooting:
 _ETL_FIND_INDEX = [
     ("command", "url", "Single-URL mode via --url."),
     ("command", "inventory", "Batch mode via --inventory."),
+    ("command", "manifest", "Batch mode via --manifest (line-based URLs)."),
     ("flag", "--url", "Fetch a single URL (prints JSON result)."),
     ("flag", "--inventory", "JSONL inventory for batch runs."),
+    ("flag", "--manifest", "Line-based URL manifest (one URL per line)."),
     ("flag", "--output", "Results JSONL path."),
     ("flag", "--audit", "Audit JSON path."),
     ("flag", "--run-artifacts", "Directory for artifacts."),
+    ("flag", "--out", "Alias for --run-artifacts."),
     ("flag", "--cache-path", "Override HTTP cache path."),
     ("flag", "--timeout", "Override request timeout."),
     ("flag", "--concurrency", "Max concurrent fetches."),
@@ -299,6 +307,46 @@ def _run_etl_find(query: str) -> str:
         if needle in haystack:
             lines.append(f"{category} {name} - {desc}")
     return "\n".join(lines)
+
+
+def _parse_manifest_lines(lines: Iterable[str]) -> List[str]:
+    urls: List[str] = []
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            continue
+        if any(ch.isspace() for ch in line):
+            raise ValueError(f"Invalid manifest line (inline metadata not allowed): {raw_line.rstrip()}")
+        urls.append(line)
+    return urls
+
+
+def _load_manifest_urls(path_or_dash: str) -> List[str]:
+    if path_or_dash == "-":
+        return _parse_manifest_lines(sys.stdin.read().splitlines())
+    path = Path(path_or_dash)
+    if not path.exists():
+        raise FileNotFoundError(f"Manifest not found: {path}")
+    return _parse_manifest_lines(path.read_text(encoding="utf-8").splitlines())
+
+
+def _build_basic_entries(urls: Iterable[str]) -> List[Dict[str, Any]]:
+    entries: List[Dict[str, Any]] = []
+    for url in urls:
+        parsed = urlparse(url)
+        entries.append(
+            {
+                K_URL: url,
+                K_DOMAIN: parsed.netloc,
+                K_CONTROLS: [],
+                K_TITLES: [],
+                K_FRAMEWORKS: [],
+                K_WORKSHEETS: [],
+            }
+        )
+    return entries
 
 
 @dataclass(frozen=True, slots=True)
@@ -1063,6 +1111,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--find", help="Search flags, env vars, artifacts")
     parser.add_argument("--url", help="Fetch a single URL and print the JSON result")
     parser.add_argument("--inventory", type=Path, help="JSONL inventory for batch runs")
+    parser.add_argument("--manifest", help="Line-based manifest (one URL per line)")
     parser.add_argument("--output", type=Path, help="Destination for fetch results JSONL")
     parser.add_argument("--audit", type=Path, help="Path to write audit metadata")
     parser.add_argument("--doctor", action="store_true", help="Print environment diagnostics and exit")
@@ -1073,6 +1122,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         default=Path("run") / "artifacts",
         help="Directory for artifacts such as outstanding reports",
     )
+    parser.add_argument("--out", type=Path, help="Alias for --run-artifacts")
     parser.add_argument("--cache-path", type=Path, help="Optional HTTP cache path")
     parser.add_argument("--timeout", type=float, help="Override request timeout (seconds)")
     parser.add_argument("--concurrency", type=int, help="Max concurrent fetches")
@@ -1115,10 +1165,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         sys.stdout.write(format_doctor_report(report))
         return 0 if report.get("ok", True) else 2
 
-    if not args.url and not args.inventory:
-        parser.error("Either --url or --inventory must be supplied")
-    if args.url and args.inventory:
-        parser.error("Use either --url or --inventory, not both")
+    if not args.url and not args.inventory and not args.manifest:
+        parser.error("Either --url, --inventory, or --manifest must be supplied")
+    mode_count = sum(1 for item in (args.url, args.inventory, args.manifest) if item)
+    if mode_count > 1:
+        parser.error("Use only one of --url, --inventory, or --manifest")
+
+    run_artifacts_dir = args.out or args.run_artifacts
 
     if args.url:
         if args.dry_run:
@@ -1129,7 +1182,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 inventory_path=None,
                 output_path=args.output,
                 audit_path=args.audit,
-                run_artifacts_dir=args.run_artifacts,
+                run_artifacts_dir=run_artifacts_dir,
                 enable_resolver=not args.no_resolver,
             )
             sys.stdout.write(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
@@ -1185,12 +1238,25 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 3
         return 0
 
-    inventory_path: Path = args.inventory
-    if not inventory_path.exists():
-        raise FileNotFoundError(inventory_path)
-    entries = _load_inventory_entries(inventory_path)
+    inventory_path: Optional[Path] = None
+    entries: List[Dict[str, Any]] = []
+    if args.inventory:
+        inventory_path = args.inventory
+        if not inventory_path.exists():
+            raise FileNotFoundError(inventory_path)
+        entries = _load_inventory_entries(inventory_path)
+    elif args.manifest:
+        urls = _load_manifest_urls(args.manifest)
+        entries = _build_basic_entries(urls)
+        if args.manifest != "-":
+            inventory_path = Path(args.manifest)
+        else:
+            inventory_path = Path.cwd() / "manifest.stdin.jsonl"
+
     if not entries:
-        parser.error(f"Inventory {inventory_path} did not contain any entries")
+        if inventory_path:
+            parser.error(f"Inventory {inventory_path} did not contain any entries")
+        parser.error("Manifest did not contain any entries")
     if args.dry_run:
         report = _build_dry_run_report(
             entries,
@@ -1198,7 +1264,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             inventory_path=inventory_path,
             output_path=args.output,
             audit_path=args.audit,
-            run_artifacts_dir=args.run_artifacts,
+            run_artifacts_dir=run_artifacts_dir,
             enable_resolver=not args.no_resolver,
         )
         sys.stdout.write(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
@@ -1217,9 +1283,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     fetch_config.overrides_path = DEFAULT_POLICY.overrides_path
 
     cache_path = args.cache_path
+    if inventory_path is None:
+        inventory_path = run_artifacts_dir / "manifest.jsonl"
     output_path = args.output or inventory_path.with_suffix(".results.jsonl")
     audit_path = args.audit or inventory_path.with_suffix(".audit.json")
-    run_artifacts_dir = args.run_artifacts
 
     result = run_fetch_pipeline(
         entries=entries,

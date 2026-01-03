@@ -37,6 +37,7 @@ fetcher get --dry-run https://example.com
 fetcher-etl --dry-run --inventory docs/smokes/urls.jsonl
 fetcher-etl --help-full
 fetcher-etl --find metrics
+fetcher-etl --manifest urls.txt --out run/artifacts/demo
 ```
 `fetcher doctor` prints a redacted environment report, while `--dry-run` validates inputs and policy without fetching. The smoke inventory contains a small set of stable URLs (HTML, PDF, GitHub blob, 404) for quick ETL checks.
 
