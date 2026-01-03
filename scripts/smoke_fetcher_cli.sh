@@ -7,6 +7,11 @@ cd "$ROOT_DIR"
 KEEP="${KEEP:-0}"
 TMP_DIR="$(mktemp -d -t fetcher-smoke-XXXXXX)"
 PAYWALL_URL="${PAYWALL_URL:-https://hbr.org/}"
+PDF_URL="${PDF_URL:-https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-53r5.pdf}"
+GITHUB_BLOB_URL="${GITHUB_BLOB_URL:-https://github.com/psf/requests/blob/main/README.md}"
+SPA_URL="${SPA_URL:-https://www.nasa.gov/}"
+MISSING_URL="${MISSING_URL:-https://example.com/does-not-exist}"
+LOCAL_FILE_URL="file://${ROOT_DIR}/test_fixtures/smoke_local.html"
 cleanup() {
   if [ "$KEEP" != "1" ]; then
     rm -rf "$TMP_DIR"
@@ -29,7 +34,7 @@ uv run fetcher --find markdown >/dev/null
 
 echo "[smoke] fetcher get (single url)"
 RUN_DIR="$TMP_DIR/consumer_single"
-uv run fetcher get https://www.nasa.gov --out "$RUN_DIR" --soft-fail >/dev/null
+uv run fetcher get "$SPA_URL" --out "$RUN_DIR" --soft-fail >/dev/null
 test -f "$RUN_DIR/consumer_summary.json"
 test -f "$RUN_DIR/Walkthrough.md"
 test -d "$RUN_DIR/downloads"
@@ -75,5 +80,28 @@ echo "[smoke] fetcher get (paywall url)"
 RUN_DIR="$TMP_DIR/consumer_paywall"
 uv run fetcher get "$PAYWALL_URL" --out "$RUN_DIR" --soft-fail >/dev/null
 test -f "$RUN_DIR/consumer_summary.json"
+
+echo "[smoke] fetcher get (pdf url)"
+RUN_DIR="$TMP_DIR/consumer_pdf"
+uv run fetcher get "$PDF_URL" --out "$RUN_DIR" --soft-fail >/dev/null
+test -f "$RUN_DIR/consumer_summary.json"
+test -d "$RUN_DIR/downloads"
+
+echo "[smoke] fetcher get (github blob url)"
+RUN_DIR="$TMP_DIR/consumer_github"
+uv run fetcher get "$GITHUB_BLOB_URL" --out "$RUN_DIR" --soft-fail >/dev/null
+test -f "$RUN_DIR/consumer_summary.json"
+test -d "$RUN_DIR/downloads"
+
+echo "[smoke] fetcher get (missing url)"
+RUN_DIR="$TMP_DIR/consumer_missing"
+uv run fetcher get "$MISSING_URL" --out "$RUN_DIR" --soft-fail >/dev/null
+test -f "$RUN_DIR/consumer_summary.json"
+
+echo "[smoke] fetcher get (file url)"
+RUN_DIR="$TMP_DIR/consumer_file"
+uv run fetcher get "$LOCAL_FILE_URL" --out "$RUN_DIR" --soft-fail >/dev/null
+test -f "$RUN_DIR/consumer_summary.json"
+test -d "$RUN_DIR/downloads"
 
 echo "[smoke] done"
