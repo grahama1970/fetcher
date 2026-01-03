@@ -232,7 +232,7 @@ def _run_in_fetch_loop(coro: "asyncio.coroutines.Coroutine"):
         except Exception:
             pass
         _FETCH_LOOP = asyncio.new_event_loop()
-        return _FETCH_LOOP.run_until_complete(coro)
+    return _FETCH_LOOP.run_until_complete(coro)
 
 
 def set_overrides_path(path: str | Path) -> None:
@@ -246,6 +246,69 @@ def set_overrides_path(path: str | Path) -> None:
     # Guard against concurrent mutation; intended for startup-time use only
     with _POLICY_LOCK:
         DEFAULT_POLICY = replace(DEFAULT_POLICY, overrides_path=p)
+
+
+def _compute_metrics(results: List[FetchResult], audit: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    counts = {"total": len(results), "success": 0, "failed": 0}
+    content_verdict_counts: Dict[str, int] = {}
+    paywall_verdict_counts: Dict[str, int] = {}
+    fallback_counts: Dict[str, int] = {}
+    proxy_attempted = 0
+    proxy_success = 0
+
+    for result in results:
+        status = getattr(result, "status", None)
+        success = bool(status == 200 and has_text_payload(result))
+        if success:
+            counts["success"] += 1
+        else:
+            counts["failed"] += 1
+
+        metadata = result.metadata or {}
+        content_verdict = str(metadata.get("content_verdict") or "unknown")
+        paywall_verdict = str(metadata.get("paywall_verdict") or "unknown")
+        content_verdict_counts[content_verdict] = content_verdict_counts.get(content_verdict, 0) + 1
+        paywall_verdict_counts[paywall_verdict] = paywall_verdict_counts.get(paywall_verdict, 0) + 1
+
+        fetch_path = metadata.get("fetch_path") or []
+        if isinstance(fetch_path, list):
+            for step in fetch_path:
+                if step == "aiohttp":
+                    continue
+                fallback_counts[step] = fallback_counts.get(step, 0) + 1
+
+        if metadata.get("proxy_rotation_attempted"):
+            proxy_attempted += 1
+        if metadata.get("proxy_rotation_used"):
+            proxy_success += 1
+
+    rate_limit_metrics = (audit or {}).get("rate_limit_metrics") if audit else None
+    return {
+        "counts": counts,
+        "content_verdict_counts": content_verdict_counts,
+        "paywall_verdict_counts": paywall_verdict_counts,
+        "fallback_counts": fallback_counts,
+        "proxy_rotation": {"attempted": proxy_attempted, "success": proxy_success},
+        "rate_limit_metrics": rate_limit_metrics if rate_limit_metrics is not None else None,
+    }
+
+
+def _print_metrics_summary(metrics: Dict[str, Any]) -> None:
+    counts = metrics.get("counts") or {}
+    fallback_counts = metrics.get("fallback_counts") or {}
+    proxy_rotation = metrics.get("proxy_rotation") or {}
+    summary = (
+        "[fetcher] metrics total={total} success={success} failed={failed} "
+        "fallbacks={fallbacks} proxy_attempted={proxy_attempted} proxy_success={proxy_success}"
+    ).format(
+        total=counts.get("total", 0),
+        success=counts.get("success", 0),
+        failed=counts.get("failed", 0),
+        fallbacks=",".join(f"{k}:{v}" for k, v in sorted(fallback_counts.items())) or "none",
+        proxy_attempted=proxy_rotation.get("attempted", 0),
+        proxy_success=proxy_rotation.get("success", 0),
+    )
+    print(summary, file=sys.stderr)
 
 
 def _write_junk_report(results: List[FetchResult], run_artifacts_dir: Optional[Path]) -> None:
@@ -807,6 +870,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         action="store_true",
         help="Exit 0 even when environment warnings are present (missing Brave/Playwright).",
     )
+    parser.add_argument("--metrics-json", help="Emit metrics JSON to a path or '-' for stdout")
+    parser.add_argument("--print-metrics", action="store_true", help="Print compact metrics summary to stderr")
     parser.add_argument(
         "--no-fanout",
         action="store_true",
@@ -853,8 +918,25 @@ def main(argv: Optional[List[str]] = None) -> int:
             args.output.parent.mkdir(parents=True, exist_ok=True)
             with args.output.open("w", encoding="utf-8") as fh:
                 fh.write(result.to_json() + "\n")
-        json.dump(payload, sys.stdout, ensure_ascii=False, indent=2)
-        sys.stdout.write("\n")
+        metrics = None
+        if args.metrics_json or args.print_metrics:
+            metrics = _compute_metrics([result], audit=None)
+        metrics_to_stdout = args.metrics_json == "-"
+        if args.metrics_json:
+            if metrics is None:
+                metrics = _compute_metrics([result], audit=None)
+            if metrics_to_stdout:
+                json.dump(metrics, sys.stdout, ensure_ascii=False, indent=2)
+                sys.stdout.write("\n")
+            else:
+                metrics_path = Path(args.metrics_json)
+                metrics_path.parent.mkdir(parents=True, exist_ok=True)
+                metrics_path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        if args.print_metrics:
+            _print_metrics_summary(metrics or _compute_metrics([result], audit=None))
+        if not metrics_to_stdout:
+            json.dump(payload, sys.stdout, ensure_ascii=False, indent=2)
+            sys.stdout.write("\n")
         if env_warnings and not args.soft_fail:
             return 3
         return 0
@@ -899,6 +981,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         rolling_window_max_windows=args.max_windows,
     )
 
+    metrics = None
+    if args.metrics_json or args.print_metrics:
+        metrics = _compute_metrics(result.results, audit=result.audit)
+
     summary = {
         "success": result.audit.get("success", 0),
         "failed": result.audit.get("failed", 0),
@@ -912,8 +998,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     if env_warnings:
         summary["environment_warnings"] = env_warnings
         summary["soft_failures"] = [item.get("code") for item in env_warnings if item.get("code")]
-    json.dump(summary, sys.stdout, ensure_ascii=False, indent=2)
-    sys.stdout.write("\n")
+    metrics_to_stdout = args.metrics_json == "-"
+    if args.metrics_json:
+        if metrics is None:
+            metrics = _compute_metrics(result.results, audit=result.audit)
+        if metrics_to_stdout:
+            json.dump(metrics, sys.stdout, ensure_ascii=False, indent=2)
+            sys.stdout.write("\n")
+        else:
+            metrics_path = Path(args.metrics_json)
+            metrics_path.parent.mkdir(parents=True, exist_ok=True)
+            metrics_path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    if args.print_metrics:
+        _print_metrics_summary(metrics or _compute_metrics(result.results, audit=result.audit))
+    if not metrics_to_stdout:
+        json.dump(summary, sys.stdout, ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
     if env_warnings and not args.soft_fail:
         return 3
     return 0

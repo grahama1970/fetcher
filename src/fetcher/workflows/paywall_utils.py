@@ -526,23 +526,18 @@ def resolve_paywalled_entries(
 
         content_verdict = (result.metadata or {}).get("content_verdict", "").lower() if result else ""
         is_missing_file = content_verdict == "missing_file"
+        fallback_reason = (result.metadata or {}).get("fallback_reason", "") if result else ""
 
-        is_404 = (status == 404)
         if not is_missing_file:
-            status_gate = (status in policy.paywall_status_codes) or is_404
-            # Treat "paywall domains + empty payload" as resolver candidates even
-            # when the HTTP status is 200. This covers bot-gated pages that
-            # respond with minimal content.
-            if not status_gate:
-                empty_payload = bool(
-                    result
-                    and (status == 200)
-                    and (domain in policy.paywall_domains)
-                    and (not has_text_payload(result))
-                )
-                if not empty_payload:
-                    continue
-            if domain not in policy.paywall_domains:
+            hard_status = status in {401, 403, 429, 451, 503}
+            hard_signal = hard_status or (fallback_reason in {"bot_blocked", "cloudflare_block_page"})
+            empty_payload = bool(
+                result
+                and (status == 200)
+                and (domain in policy.paywall_domains)
+                and (not has_text_payload(result))
+            )
+            if not (hard_signal or empty_payload):
                 continue
         if not _verdict_allows_resolver(result):
             continue

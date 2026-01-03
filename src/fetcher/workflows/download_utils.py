@@ -448,29 +448,45 @@ def persist_downloads(
     run_artifacts_dir: Path,
     *,
     allow_junk: bool = False,
-) -> None:
+) -> Dict[str, Optional[str]]:
     """Persist raw downloads without rolling windows.
 
-    This is a thin wrapper around _persist_blob_for_result for consumer-style
-    runs that always want a download artifact. When allow_junk is False, it
-    mirrors the ETL contract and only persists content_verdict == "ok".
+    Returns a mapping of result.url -> error message (or None on success).
+    When allow_junk is False, it mirrors the ETL contract and only persists
+    content_verdict == "ok".
     """
 
     run_artifacts_dir.mkdir(parents=True, exist_ok=True)
     download_dir = run_artifacts_dir / "downloads"
     download_dir.mkdir(parents=True, exist_ok=True)
+    errors: Dict[str, Optional[str]] = {}
 
     for result in results:
+        url = getattr(result, "url", "") or ""
         if not allow_junk:
             verdict = (result.metadata or {}).get("content_verdict")
             if verdict and verdict != "ok":
+                errors[url] = None
                 continue
-        blob_path = _persist_blob_for_result(result, download_dir)
+        try:
+            blob_path = _persist_blob_for_result(result, download_dir)
+        except Exception as exc:
+            metadata = dict(result.metadata or {})
+            metadata["download_error"] = str(exc)
+            result.metadata = metadata
+            errors[url] = str(exc)
+            continue
         if blob_path is None:
+            metadata = dict(result.metadata or {})
+            metadata["download_missing_no_payload"] = True
+            result.metadata = metadata
+            errors[url] = None
             continue
         metadata = dict(result.metadata or {})
         metadata["download_mode"] = "download_only"
         result.metadata = metadata
+        errors[url] = None
+    return errors
 
 
 def _read_raw_text_for_extraction(result: FetchResult) -> str:

@@ -194,6 +194,16 @@ ETL runs (`fetcher-etl`) accept `--soft-fail` to keep exit code 0 when environme
 
 `fetcher-etl` remains the full ETL CLI with all knobs and reports.
 
+### ETL metrics (opt-in)
+Use these flags with `fetcher-etl` to emit lightweight reliability metrics:
+
+```
+fetcher-etl --inventory urls.jsonl --metrics-json metrics.json
+fetcher-etl --inventory urls.jsonl --metrics-json - --print-metrics
+```
+
+`--metrics-json -` writes the metrics object to stdout (suppressing the default summary).
+
 Audit files now also embed `rate_limit_metrics` (overall runtime, effective RPS, per-domain 429 stats)
 and, when configured, a `proxy_rotation` block so operators can trace throttling and rotation usage
 without spelunking logs.

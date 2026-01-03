@@ -78,6 +78,14 @@ Missing Brave/Playwright dependencies surface as environment warnings in stderr 
 Use `--soft-fail` on the consumer CLI to keep exit code 0 when warnings exist.
 ETL (`fetcher-etl`) supports `--soft-fail` for the same behavior.
 
+### ETL metrics (opt-in)
+```bash
+fetcher-etl --inventory urls.jsonl --metrics-json metrics.json
+fetcher-etl --inventory urls.jsonl --metrics-json - --print-metrics
+```
+
+`--metrics-json -` writes the metrics object to stdout (and suppresses the default summary).
+
 ## 5. Optional alternates
 Install the extras and set SciLLM env vars:
 ```bash

@@ -436,6 +436,92 @@ _SOFT_404_TEMPLATES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ),
 )
 
+_CLOUDFLARE_TOKENS = ("cf-error-details", "error 1020")
+_CLOUDFLARE_HINTS = ("cloudflare", "access denied")
+_BOT_BLOCK_TOKENS = ("you are unable to access", "you have been blocked", "temporarily blocked")
+
+
+def _looks_cloudflare_block(lowered: str) -> bool:
+    if not lowered:
+        return False
+    if any(token in lowered for token in _CLOUDFLARE_TOKENS):
+        return True
+    if "cloudflare" in lowered and any(token in lowered for token in _CLOUDFLARE_HINTS):
+        return True
+    return False
+
+
+def _looks_bot_blocked(lowered: str) -> bool:
+    if not lowered:
+        return False
+    return any(token in lowered for token in _BOT_BLOCK_TOKENS)
+
+
+def _select_fallback_reason(
+    *,
+    status: int,
+    text: str,
+    soft_404_id: Optional[str] = None,
+) -> Optional[str]:
+    lowered = (text or "").lower()
+    if soft_404_id:
+        return "soft_404"
+    if status == 429:
+        return "rate_limited_429"
+    if _looks_cloudflare_block(lowered):
+        return "cloudflare_block_page"
+    if _looks_bot_blocked(lowered):
+        return "bot_blocked"
+    if status == 200 and len((text or "").strip()) < 100:
+        return "empty_payload"
+    if status in {401, 403, 404, 500, 503}:
+        return "http_error_retry_exhausted"
+    return None
+
+
+def _dedupe_fetch_path(path: List[str]) -> List[str]:
+    seen: Set[str] = set()
+    ordered: List[str] = []
+    for item in path:
+        if item in seen:
+            continue
+        seen.add(item)
+        ordered.append(item)
+    return ordered
+
+
+def _build_fetch_path(method: str, metadata: Dict[str, Any], *, from_cache: bool) -> List[str]:
+    if from_cache:
+        return ["cache"]
+    if method == "file":
+        return ["file"]
+    if method == "github_cli":
+        return ["github_cli"]
+
+    path: List[str] = ["aiohttp"]
+    if metadata.get("proxy_rotation_used"):
+        path.append("proxy_rotation")
+    if metadata.get("playwright") and not metadata.get("playwright_failed"):
+        path.append("playwright")
+    via = (metadata.get("via") or "").lower()
+    if via == "wayback" or method == "wayback":
+        path.append("wayback")
+    if via == "jina" or method == "jina":
+        path.append("jina")
+    if metadata.get("alternate_note") == "brave_redirect":
+        path.append("brave")
+    if metadata.get("google_translate_url") or method == "google_translate":
+        path.append("google_translate")
+    return _dedupe_fetch_path(path)
+
+
+def _apply_provenance(metadata: Dict[str, Any], method: str, *, from_cache: bool) -> Dict[str, Any]:
+    fetch_path = _build_fetch_path(method, metadata, from_cache=from_cache)
+    metadata["fetch_path"] = fetch_path
+    candidate = metadata.pop("fallback_reason_candidate", None)
+    metadata["fallback_reason"] = candidate if candidate else None
+    return metadata
+
 
 def _detect_soft_404(text: str) -> Optional[str]:
     """Return a template id when the body matches a known soft-404/blocked page."""
@@ -1135,6 +1221,7 @@ class URLFetcher:
                 except Exception:
                     pass
                 metadata = _ensure_redirect({**base_metadata, **cache_meta})
+                metadata = _apply_provenance(metadata, cached.get("method", "cache"), from_cache=True)
                 self._mark_rate_limit_meta(metadata, cached.get("status", 0))
                 return FetchResult(
                     url=url,
@@ -1154,6 +1241,7 @@ class URLFetcher:
                     status, content_type, text, method, extra_metadata, local_bytes = self._fetch_from_file(parsed)
                     fetched_at = datetime.now(timezone.utc).isoformat()
                     metadata = _ensure_redirect({**base_metadata, **(extra_metadata or {})})
+                    metadata = _apply_provenance(metadata, method, from_cache=False)
                     self._mark_rate_limit_meta(metadata, status)
                     return FetchResult(
                         url=url,
@@ -1223,6 +1311,7 @@ class URLFetcher:
                     self._cache_dirty = True
                 error = None
                 metadata = _ensure_redirect({**base_metadata, **(extra_metadata or {})})
+                metadata = _apply_provenance(metadata, method, from_cache=False)
                 self._mark_rate_limit_meta(metadata, status)
             except Exception as exc:  # pragma: no cover - runtime failure path
                 status = -1
@@ -1232,6 +1321,7 @@ class URLFetcher:
                 method = "error"
                 error = str(exc)
                 metadata = _ensure_redirect(dict(base_metadata))
+                metadata = _apply_provenance(metadata, method, from_cache=False)
                 self._mark_rate_limit_meta(metadata, status)
                 if status in {404, 410, -1}:
                     hint = self._brave_lookup(url)
@@ -1284,6 +1374,7 @@ class URLFetcher:
         cache_metadata = {**request.metadata, **(extra_metadata or {})}
         metadata = {**base_metadata, **cache_metadata}
         metadata.setdefault("github_fetch_url", request.fetch_url)
+        metadata = _apply_provenance(metadata, method, from_cache=False)
         self._mark_rate_limit_meta(metadata, status)
         result = FetchResult(
             url=request.original_url,
@@ -1586,6 +1677,10 @@ class URLFetcher:
             text = raw_bytes.decode("utf-8", "ignore")
             body_bytes = raw_bytes
 
+        fallback_reason_candidate = _select_fallback_reason(status=status, text=text)
+        if fallback_reason_candidate:
+            extra_metadata["fallback_reason_candidate"] = fallback_reason_candidate
+
         fallback_statuses = {401, 403, 404, 429}
         fallback_allowed = async_playwright is not None
         domain_requires_spa = domain in SPA_FALLBACK_DOMAINS
@@ -1671,6 +1766,11 @@ class URLFetcher:
             if soft_404_id:
                 extra_metadata["soft_404_detected"] = True
                 extra_metadata["soft_404_template"] = soft_404_id
+                extra_metadata["fallback_reason_candidate"] = _select_fallback_reason(
+                    status=status,
+                    text=text or "",
+                    soft_404_id=soft_404_id,
+                )
                 status = 404
                 text = ""
                 body_bytes = None

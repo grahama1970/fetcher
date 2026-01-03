@@ -4,8 +4,6 @@ import json
 import os
 import secrets
 import sys
-import tempfile
-from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, TextIO, Tuple
@@ -16,7 +14,6 @@ from .workflows.download_utils import annotate_paywall_metadata, materialize_ext
 from .workflows.extract_utils import evaluate_result_content
 from .workflows.fetcher import DEFAULT_POLICY, _run_in_fetch_loop, _env_bool, _env_int
 from .workflows.fetcher_utils import collect_environment_warnings
-from .workflows.paywall_utils import resolve_paywalled_entries
 from .workflows.web_fetch import FetchConfig, FetchResult, URLFetcher
 
 CONSUMER_ID_KEY = "consumer_id"
@@ -159,6 +156,7 @@ def _build_consumer_summary(
     emit: Set[str],
     emit_fit_md: bool,
     fit_md_requested: bool,
+    download_errors: Optional[Dict[str, Optional[str]]] = None,
 ) -> Dict[str, Any]:
     results_by_id: Dict[Any, FetchResult] = {}
     for result in results:
@@ -204,7 +202,17 @@ def _build_consumer_summary(
         markdown_path = metadata.get("markdown_path")
         fit_markdown_path = metadata.get("fit_markdown_path")
         if "download" in emit and not download_path:
-            errors.append("download_not_persisted")
+            if metadata.get("download_missing_no_payload"):
+                warnings.append("download_missing_no_payload")
+            else:
+                error_value = None
+                if download_errors is not None:
+                    error_value = download_errors.get(result.url)
+                error_value = error_value or metadata.get("download_error")
+                if error_value:
+                    errors.append(error_value)
+                else:
+                    errors.append("download_not_persisted")
         if "text" in emit and not extracted_text_path:
             warnings.append("text_not_materialized")
         if "md" in emit and not markdown_path:
@@ -386,37 +394,13 @@ def run_consumer(
 
     emit_fit_md = "fit_md" in emit and "md" in emit
     fit_md_requested = "fit_md" in emit
+    download_errors: Optional[Dict[str, Optional[str]]] = None
     if "download" in emit:
-        persist_downloads(results, run_dir, allow_junk=True)
+        download_errors = persist_downloads(results, run_dir, allow_junk=True)
 
     for result in results:
         evaluate_result_content(result)
     annotate_paywall_metadata(results, DEFAULT_POLICY)
-
-    applied: List[Dict[str, Any]] = []
-    if entries:
-        policy = replace(DEFAULT_POLICY, enable_perplexity_resolver=False)
-        with tempfile.TemporaryDirectory() as tmpdir:
-            inventory_path = Path(tmpdir) / "consumer_inventory.jsonl"
-            inventory_path.write_text("\n".join(json.dumps(entry, ensure_ascii=False) for entry in entries) + "\n", encoding="utf-8")
-            applied = resolve_paywalled_entries(
-                entries,
-                results,
-                config,
-                inventory_path.parent,
-                inventory_path,
-                Path(tmpdir),
-                limit=24,
-                policy=policy,
-                run_fetch_loop=_run_in_fetch_loop,
-            )
-
-    if applied:
-        if "download" in emit:
-            persist_downloads(results, run_dir, allow_junk=True)
-        for result in results:
-            evaluate_result_content(result)
-        annotate_paywall_metadata(results, DEFAULT_POLICY)
 
     if "text" in emit:
         materialize_extracted_text(
@@ -448,6 +432,7 @@ def run_consumer(
         emit=emit,
         emit_fit_md=emit_fit_md,
         fit_md_requested=fit_md_requested,
+        download_errors=download_errors,
     )
     if env_warnings:
         summary["environment_warnings"] = env_warnings

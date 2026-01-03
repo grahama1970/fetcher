@@ -102,3 +102,60 @@ def test_wayback_precedes_perplexity(monkeypatch, tmp_path):
     assert flags["wayback"] is True
     assert flags["perplexity"] is False
     assert applied and applied[0]["provider"] == "wayback"
+
+
+def test_resolver_candidate_on_bot_blocked_signal(monkeypatch, tmp_path):
+    entry = {
+        "url": "https://blocked.example.com/page",
+        "domain": "blocked.example.com",
+        "controls": ["CTRL-2"],
+    }
+    entries = [dict(entry)]
+    inventory_path = tmp_path / "inventory.jsonl"
+    inventory_path.write_text(json.dumps(entry) + "\n", encoding="utf-8")
+    run_artifacts_dir = tmp_path / "artifacts"
+    run_artifacts_dir.mkdir(parents=True, exist_ok=True)
+
+    result = FetchResult(
+        url=entry["url"],
+        domain=entry["domain"],
+        status=200,
+        content_type="text/html",
+        text="",
+        fetched_at="now",
+        method="aiohttp",
+        metadata={"fallback_reason": "bot_blocked"},
+    )
+    results = [result]
+
+    brave_targets = {}
+
+    def fake_brave(targets, *args, **kwargs):
+        for original_url, _ in targets:
+            brave_targets[original_url] = True
+        return {}
+
+    def fake_wayback(pending, *args, **kwargs):
+        return []
+
+    monkeypatch.setattr(paywall_utils, "_search_brave_for_alternates", fake_brave)
+    monkeypatch.setattr(paywall_utils, "_apply_wayback_fallback", fake_wayback)
+    monkeypatch.setattr(paywall_utils, "_direct_override_candidate", lambda *args, **kwargs: None)
+
+    root = tmp_path / "root"
+    (root / "data" / "processed").mkdir(parents=True, exist_ok=True)
+
+    applied = paywall_utils.resolve_paywalled_entries(
+        entries=entries,
+        results=results,
+        config=FetchConfig(),
+        root=root,
+        inventory_path=inventory_path,
+        run_artifacts_dir=run_artifacts_dir,
+        limit=1,
+        policy=DEFAULT_POLICY,
+        run_fetch_loop=lambda coro: ([], {}),
+    )
+
+    assert entry["url"] in brave_targets
+    assert applied == []
