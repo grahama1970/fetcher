@@ -53,6 +53,7 @@ except Exception:  # pragma: no cover - handled at runtime
     async_playwright = None  # type: ignore
 
 SPA_FALLBACK_DOMAINS = {
+    "antigravity.google",
     "d3fend.mitre.org",
     "atlas.mitre.org",
     "www.reuters.com",
