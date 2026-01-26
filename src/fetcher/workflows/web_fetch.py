@@ -942,23 +942,48 @@ class URLFetcher:
         start_time = time.perf_counter()
         async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
             # Phase 1: fetch provided entries
-            tasks: List[asyncio.Task] = []
+            # Worker pool implementation to avoid Head-of-Line blocking and resource exhaustion
+            queue: asyncio.Queue = asyncio.Queue()
             for entry in unique_entries:
-                task = asyncio.create_task(self._fetch_entry(entry, session, semaphore, per_domain))
-                setattr(task, "_sparta_entry", entry)
-                tasks.append(task)
-            total = len(tasks)
-            completed = 0
-            for task in asyncio.as_completed(tasks):
-                entry = getattr(task, "_sparta_entry", {})
-                result = await task
-                results.append(result)
-                completed += 1
-                if progress_hook is not None:
+                queue.put_nowait(entry)
+
+            # Use a dummy semaphore for _fetch_entry since concurrency is controlled by worker count
+            # This prevents the nested-lock deadlock scenario.
+            dummy_semaphore = asyncio.Semaphore(9999) 
+
+            async def worker():
+                while True:
                     try:
-                        progress_hook(completed, total, entry, result)
-                    except Exception:
+                        entry = queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    
+                    try:
+                        # Use dummy_semaphore to bypass the internal global lock, relying on worker limit instead
+                        result = await self._fetch_entry(entry, session, dummy_semaphore, per_domain)
+                        results.append(result)
+                        
+                        if progress_hook is not None:
+                            try:
+                                # Start counting from 1? The original code had 'completed' var.
+                                completed_count = len(results)
+                                progress_hook(completed_count, len(unique_entries), entry, result)
+                            except Exception:
+                                pass
+                            
+                    except Exception as e:
+                        print(f"Worker exception: {e}")
                         pass
+                    finally:
+                        queue.task_done()
+
+            workers = [
+                asyncio.create_task(worker())
+                for _ in range(self.config.concurrency)
+            ]
+            
+            if unique_entries:
+                await asyncio.gather(*workers)
 
             # Phase 2 (optional): hub fan-out – fetch child links discovered on link-hub pages
             try:
