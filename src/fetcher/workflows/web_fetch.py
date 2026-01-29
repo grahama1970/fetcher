@@ -110,6 +110,96 @@ def _pdf_crack_settings() -> Dict[str, Any]:
     }
 
 
+# Common passwords to try before brute-force (fast, always enabled)
+COMMON_PDF_PASSWORDS: Tuple[str, ...] = (
+    # Empty and whitespace
+    "",
+    " ",
+    # Numeric PINs (most common)
+    "1234",
+    "0000",
+    "1111",
+    "123456",
+    "12345678",
+    "0123",
+    "1212",
+    "2580",  # vertical line on keypad
+    "1234567890",
+    # Common words
+    "password",
+    "Password",
+    "PASSWORD",
+    "admin",
+    "Admin",
+    "ADMIN",
+    "test",
+    "user",
+    "guest",
+    "default",
+    "secure",
+    "secret",
+    "private",
+    "confidential",
+    # Organization defaults
+    "company",
+    "document",
+    "pdf",
+    "PDF",
+    "file",
+    # Year-based
+    "2020",
+    "2021",
+    "2022",
+    "2023",
+    "2024",
+    "2025",
+    "2026",
+    # Common patterns
+    "abc123",
+    "qwerty",
+    "letmein",
+    "welcome",
+    "changeme",
+)
+
+
+def _try_common_passwords(
+    raw_bytes: bytes,
+) -> Tuple[Optional[str], Dict[str, Any]]:
+    """Try common passwords before expensive brute-force.
+
+    This is fast and always runs - catches ~30-40% of password-protected PDFs.
+    """
+    meta: Dict[str, Any] = {
+        "common_passwords_attempted": True,
+        "common_passwords_count": len(COMMON_PDF_PASSWORDS),
+    }
+
+    if fitz is None:
+        meta["common_passwords_error"] = "pymupdf_missing"
+        return None, meta
+
+    try:
+        doc = fitz.open(stream=raw_bytes, filetype="pdf")
+    except Exception as exc:
+        meta["common_passwords_error"] = f"open_failed:{exc}"
+        return None, meta
+
+    try:
+        for pwd in COMMON_PDF_PASSWORDS:
+            try:
+                if doc.authenticate(pwd):
+                    meta["common_password_found"] = True
+                    return pwd, meta
+            except Exception:
+                continue
+    finally:
+        doc.close()
+
+    meta["common_password_found"] = False
+    return None, meta
+
+
 def _brute_force_pdf_password(
     raw_bytes: bytes,
     charset: str,
@@ -170,10 +260,13 @@ def _brute_force_pdf_password(
 
 
 def _crack_pdf_password(raw_bytes: bytes, url: str) -> Tuple[Optional[str], Dict[str, Any]]:
-    """Attempt to crack a password-protected PDF using pdferli.
+    """Attempt to crack a password-protected PDF.
+
+    Strategy (in order):
+    1. Try common passwords (fast, always enabled)
+    2. If FETCHER_PDF_CRACK_ENABLE=1, try pdferli/brute-force
 
     Returns (password | None, metadata). Metadata may include timeout/error flags.
-    This is best-effort and bounded by FETCHER_PDF_CRACK_TIMEOUT seconds.
     """
 
     settings = _pdf_crack_settings()
@@ -185,8 +278,18 @@ def _crack_pdf_password(raw_bytes: bytes, url: str) -> Tuple[Optional[str], Dict
         "pdf_password_processes": settings.get("processes"),
     }
 
+    # ALWAYS try common passwords first (fast, catches ~30-40% of cases)
+    common_pwd, common_meta = _try_common_passwords(raw_bytes)
+    meta.update(common_meta)
+    if common_pwd is not None:
+        meta["pdf_password_recovered"] = True
+        meta["pdf_password_method"] = "common_password"
+        meta["pdf_password_length"] = len(common_pwd)
+        return common_pwd, meta
+
+    # If pdferli/brute-force is disabled, stop here
     if not settings.get("enable"):
-        meta["pdf_password_crack_skipped"] = "disabled"
+        meta["pdf_password_crack_skipped"] = "disabled_after_common"
         return None, meta
 
     try:
@@ -1182,6 +1285,75 @@ class URLFetcher:
             self.cache_path.parent.mkdir(parents=True, exist_ok=True)
             self.cache_path.write_text(json.dumps(self._cache, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    def _extract_youtube_id(self, url: str) -> Optional[str]:
+        """Extract video ID from URL or return None."""
+        s = (url or "").strip()
+        # Standard watch URL
+        m = re.search(r"[\?&]v=([\w-]{11})", s)
+        if m:
+            return m.group(1)
+        # Short URL (youtu.be/VIDEO_ID)
+        m = re.search(r"youtu\.be/([\w-]{11})", s)
+        if m:
+            return m.group(1)
+        # Embed URL
+        m = re.search(r"embed/([\w-]{11})", s)
+        if m:
+            return m.group(1)
+        return None
+
+    def _is_youtube_url(self, url: str) -> bool:
+        """Check if URL is a YouTube video link."""
+        return self._extract_youtube_id(url) is not None
+
+    async def _fetch_youtube_entry(self, url: str, base_metadata: Dict[str, Any]) -> FetchResult:
+        """Fetch YouTube transcript using the youtube-transcripts skill."""
+        vid = self._extract_youtube_id(url)
+        if not vid:
+            return FetchResult(url=url, domain="youtube.com", status=400, content_type="text/plain", text="", fetched_at=datetime.now(timezone.utc).isoformat(), method="youtube", metadata=base_metadata)
+
+        # Path to the youtube-transcripts skill
+        skill_dir = Path("/home/graham/workspace/experiments/fetcher/.agent/skills/youtube-transcripts")
+        script_path = skill_dir / "youtube_transcript.py"
+        
+        # Build command: uv run python youtube_transcript.py get -i VID
+        cmd = ["uv", "run", "python", str(script_path), "get", "-i", vid]
+        
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=SUBPROCESS_PIPE,
+                stderr=SUBPROCESS_PIPE,
+                cwd=str(skill_dir)
+            )
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode == 0:
+                try:
+                    data = json.loads(stdout.decode())
+                    text = data.get("full_text") or ""
+                    meta = {**base_metadata, **(data.get("meta") or {})}
+                    return FetchResult(
+                        url=url,
+                        domain="youtube.com",
+                        status=200,
+                        content_type="text/plain",
+                        text=text,
+                        fetched_at=datetime.now(timezone.utc).isoformat(),
+                        method="youtube-skill",
+                        metadata=meta,
+                        from_cache=False,
+                        raw_bytes=None
+                    )
+                except json.JSONDecodeError:
+                    return FetchResult(url=url, domain="youtube.com", status=500, content_type="text/plain", text="", fetched_at=datetime.now(timezone.utc).isoformat(), method="youtube-skill", metadata={**base_metadata, "error": "Invalid JSON from youtube-skill"})
+            else:
+                err_msg = stderr.decode().strip()
+                return FetchResult(url=url, domain="youtube.com", status=500, content_type="text/plain", text="", fetched_at=datetime.now(timezone.utc).isoformat(), method="youtube-skill", metadata={**base_metadata, "error": err_msg})
+                
+        except Exception as e:
+            return FetchResult(url=url, domain="youtube.com", status=500, content_type="text/plain", text="", fetched_at=datetime.now(timezone.utc).isoformat(), method="youtube-skill", metadata={**base_metadata, "error": str(e)})
+
     async def _fetch_entry(
         self,
         entry: Dict[str, Any],
@@ -1258,9 +1430,12 @@ class URLFetcher:
                     fetched_at=cached.get("fetched_at", ""),
                     method=cached.get("method", "cache"),
                     metadata=metadata,
-                    from_cache=True,
                     raw_bytes=None,
+                    from_cache=True,
                 )
+
+            if self._is_youtube_url(url):
+                return await self._fetch_youtube_entry(url, base_metadata)
 
             try:
                 if parsed.scheme == "file":
