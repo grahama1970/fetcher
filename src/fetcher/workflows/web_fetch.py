@@ -2573,12 +2573,12 @@ class URLFetcher:
                         if not doc.authenticate(password):
                             metadata.setdefault("pdf_password_crack_error", "authentication_failed")
                             metadata["pdf_text_extracted"] = False
-                            return "", metadata
+                            raise RuntimeError(f"PDF authentication failed for {url}")
                     metadata["pdf_password_recovered"] = True
                 else:
                     metadata["pdf_password_recovered"] = False
                     metadata["pdf_text_extracted"] = False
-                    return "", metadata
+                    raise RuntimeError(f"PDF password not recovered for {url}")
 
             text_parts: List[str] = []
             for page in doc:
