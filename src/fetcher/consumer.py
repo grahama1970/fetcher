@@ -4,12 +4,14 @@ import json
 import os
 import secrets
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, TextIO, Tuple
 from urllib.parse import urlparse
 
 from .core.keys import K_CONTROLS, K_DOMAIN, K_FRAMEWORKS, K_TITLES, K_URL, K_WORKSHEETS
+from .monitoring import EventEmitter
 from .workflows.download_utils import annotate_paywall_metadata, materialize_extracted_text, materialize_markdown, persist_downloads
 from .workflows.extract_utils import evaluate_result_content
 from .workflows.fetcher import DEFAULT_POLICY, _run_in_fetch_loop, _env_bool, _env_int
@@ -472,8 +474,56 @@ def run_consumer(
     else:
         config.disable_http_cache = cache_path is None
 
+    # Task Monitor state file
+    monitor_state_path = run_dir / ".batch_state.json"
+    failed_count = 0
+
+    # NDJSON event emitter for real-time monitoring
+    emitter = EventEmitter("fetcher-consumer", task_id=run_id)
+    emitter.init(total=len(entries), description=f"Fetching {command}")
+
+    def progress_hook(completed: int, total: int, entry: Dict[str, Any], result: FetchResult) -> None:
+        nonlocal failed_count
+        if result.status != 200:
+            failed_count += 1
+
+        # Log to stderr for tee-ability
+        status_icon = "✓" if result.status == 200 else "✗"
+        print(f"[fetcher] {status_icon} {completed}/{total} {result.status} {result.url}", file=sys.stderr)
+
+        # Emit NDJSON event for task-monitor integration
+        emitter.fetch_complete(
+            index=completed,
+            url=result.url,
+            status=result.status,
+            ok=result.status == 200,
+            domain=result.domain,
+            method=result.method,
+            content_verdict=result.metadata.get("content_verdict") if result.metadata else None,
+        )
+
+        try:
+            state = {
+                "completed": completed,
+                "total": total,
+                "description": f"Fetching {command} ({run_id})",
+                "current_item": result.url[:100],
+                "stats": {
+                    "success": completed - failed_count,
+                    "failed": failed_count
+                },
+                "last_updated": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "status": "running"
+            }
+            monitor_state_path.write_text(json.dumps(state), encoding="utf-8")
+        except Exception:
+            pass
+
     fetcher = URLFetcher(config, cache_path=cache_path)
-    results, _audit = _run_in_fetch_loop(fetcher.fetch_many(entries))
+    results, _audit = _run_in_fetch_loop(fetcher.fetch_many(entries, progress_hook=progress_hook))
+
+    # Emit completion event
+    emitter.done(success=failed_count == 0, summary={"total": len(results), "failed": failed_count})
 
     emit_fit_md = "fit_md" in emit and "md" in emit
     fit_md_requested = "fit_md" in emit
@@ -526,6 +576,16 @@ def run_consumer(
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     walkthrough_path = run_dir / "Walkthrough.md"
     walkthrough_path.write_text(_render_walkthrough(summary), encoding="utf-8")
+
+    # Final task-monitor update
+    try:
+        if monitor_state_path.exists():
+            state = json.loads(monitor_state_path.read_text(encoding="utf-8"))
+            state["status"] = "completed"
+            state["last_updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            monitor_state_path.write_text(json.dumps(state), encoding="utf-8")
+    except Exception:
+        pass
 
     exit_code = 0
     if not soft_fail:

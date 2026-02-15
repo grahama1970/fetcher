@@ -4,7 +4,7 @@
 
 [project]
 name = "fetcher"
-version = "0.1.13"
+version = "0.1.19"
 description = "Standalone release of the SciLLM/Sparta fetcher pipeline with Brave + SciLLM alternates."
 readme = "README.md"
 authors = [{name = "Graham Anderson", email = "graham@grahama.co"}]

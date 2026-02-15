@@ -11,6 +11,7 @@ import mimetypes
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass, replace
 import threading
 from pathlib import Path
@@ -77,6 +78,8 @@ from .download_utils import (
     materialize_markdown,
 )
 from .extract_utils import evaluate_result_content
+from ..monitoring import EventEmitter
+from ..quality import BATCH_GATE
 from .outstanding_utils import build_outstanding_reports
 from .doctor import build_doctor_report, format_doctor_report
 
@@ -758,32 +761,184 @@ def run_fetch_pipeline(
         fetch_config.screenshots_dir = run_artifacts_dir / "screenshots"
 
     fetcher = URLFetcher(fetch_config, cache_path=cache_path)
-    results, audit = _run_in_fetch_loop(fetcher.fetch_many(entries, progress_hook=progress_hook))
 
-    for result in results:
+
+    # Prepare for incremental processing
+    hash_cache_path = run_artifacts_dir / "fetch_cache" / "content_hashes.json"
+    content_cache: Dict[str, Any] = {}
+    if hash_cache_path.exists():
+        try:
+            content_cache = json.loads(hash_cache_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    # Ensure output directory exists and clear/create the output file
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    # Open in 'w' mode to clear it, then close. We'll append in the hook.
+    # Actually, we can just keep it open.
+    output_fh = output_path.open("w", encoding="utf-8")
+
+    # Task Monitor state file
+    monitor_state_path = run_artifacts_dir / ".batch_state.json"
+    failed_count = 0
+    consecutive_errors = 0
+
+    # NDJSON event emitter for real-time monitoring
+    emitter = EventEmitter("fetcher-etl", task_id=run_artifacts_dir.name)
+    emitter.init(total=len(entries), description="ETL Pipeline")
+
+    def streaming_hook(completed: int, total: int, entry: Dict[str, Any], result: FetchResult) -> None:
+        nonlocal failed_count, consecutive_errors
+        # 1. Post-process the single result
         evaluate_result_content(result)
 
-    # Persist extracted/clean text so consumers (and humans) can easily inspect
-    # usable content without re-implementing extraction in downstream repos.
-    materialize_extracted_text(
-        results,
-        run_artifacts_dir,
-        enabled=bool(getattr(policy, "emit_extracted_text", True)),
-        min_chars=int(getattr(policy, "extracted_text_min_chars", 1) or 1),
-    )
-    materialize_markdown(
-        results,
-        run_artifacts_dir,
-        enabled=bool(getattr(policy, "emit_markdown", False)),
-        min_chars=int(getattr(policy, "markdown_min_chars", 1) or 1),
-        emit_fit_markdown=bool(getattr(policy, "emit_fit_markdown", True)),
-        fit_min_chars=int(getattr(policy, "fit_markdown_min_chars", 200) or 200),
-        overrides_path=getattr(policy, "overrides_path", None),
+        if result.status != 200:
+            failed_count += 1
+
+        # 2. Materialize artifacts
+        materialize_extracted_text(
+            [result],
+            run_artifacts_dir,
+            enabled=bool(getattr(policy, "emit_extracted_text", True)),
+            min_chars=int(getattr(policy, "extracted_text_min_chars", 1) or 1),
+        )
+        materialize_markdown(
+            [result],
+            run_artifacts_dir,
+            enabled=bool(getattr(policy, "emit_markdown", False)),
+            min_chars=int(getattr(policy, "markdown_min_chars", 1) or 1),
+            emit_fit_markdown=bool(getattr(policy, "emit_fit_markdown", True)),
+            fit_min_chars=int(getattr(policy, "fit_markdown_min_chars", 200) or 200),
+            overrides_path=getattr(policy, "overrides_path", None),
+        )
+
+        # 3. Paywall annotation
+        annotate_paywall_metadata([result], policy)
+
+        # 4. Content change detection (Incremental version of _annotate_content_changes)
+        metadata = dict(result.metadata or {})
+        normalized = metadata.get("url_normalized") or _wf_normalize_url(result.url)
+
+        if normalized:
+            payload: bytes = b""
+            sample: str = ""
+            if result.text:
+                payload = result.text.encode("utf-8")
+                sample = result.text[:800]
+            elif result.raw_bytes:
+                payload = result.raw_bytes
+                sample = ""
+
+            if payload:
+                sha = hashlib.sha256(payload).hexdigest()
+                metadata["content_sha256"] = sha
+                metadata["content_text_len"] = len(result.text or "")
+                previous = content_cache.get(normalized)
+                if previous:
+                    metadata["content_previous_sha256"] = previous.get("sha")
+                    metadata["content_previous_len"] = previous.get("length")
+                    metadata["content_previous_fetched_at"] = previous.get("fetched_at")
+                    metadata["content_changed"] = sha != previous.get("sha")
+                    prev_sample = previous.get("sample") or ""
+                    if result.text and prev_sample:
+                        ratio = difflib.SequenceMatcher(None, prev_sample, result.text[: len(prev_sample) or 1]).ratio()
+                        metadata["content_diff_ratio"] = round(ratio, 4)
+                else:
+                    metadata["content_changed"] = True
+
+                content_cache[normalized] = {
+                    "sha": sha,
+                    "length": len(result.text or ""),
+                    "fetched_at": result.fetched_at,
+                    "sample": sample,
+                }
+                result.metadata = metadata
+
+        # 5. Write to output file immediately
+        try:
+            output_fh.write(result.to_json() + "\n")
+            output_fh.flush()
+        except Exception as e:
+            print(f"[fetcher] error writing result: {e}", file=sys.stderr)
+
+        # 6. Log progress
+        status_icon = "✓" if result.status == 200 else "✗"
+        print(f"[fetcher] {status_icon} {completed}/{total} {result.status} {result.url}", file=sys.stderr)
+
+        # 6a. Emit NDJSON event for task-monitor integration
+        emitter.fetch_complete(
+            index=completed,
+            url=result.url,
+            status=result.status,
+            ok=result.status == 200,
+            domain=result.domain,
+            method=result.method,
+            content_verdict=(result.metadata or {}).get("content_verdict"),
+        )
+
+        # 6b. Track consecutive errors and check quality gate
+        if result.status != 200:
+            consecutive_errors += 1
+        else:
+            consecutive_errors = 0
+
+        should_continue, reason = BATCH_GATE.check_batch_health(
+            completed=completed,
+            failed=failed_count,
+            consecutive_errors=consecutive_errors,
+        )
+        if not should_continue:
+            emitter.error(url="batch", error=f"Quality gate: {reason}", category="quality_gate")
+            print(f"[fetcher] WARN: Quality gate triggered: {reason}", file=sys.stderr)
+
+        # 7. Chain original hook
+        if progress_hook:
+            progress_hook(completed, total)
+
+        # 8. Update task-monitor state
+        try:
+            state = {
+                "completed": completed,
+                "total": total,
+                "description": f"Fetching URLs ({run_artifacts_dir.name})",
+                "current_item": result.url[:100],
+                "stats": {
+                    "success": completed - failed_count,
+                    "failed": failed_count
+                },
+                "last_updated": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "status": "running"
+            }
+            monitor_state_path.write_text(json.dumps(state), encoding="utf-8")
+        except Exception:
+            pass
+
+    try:
+        results, audit = _run_in_fetch_loop(fetcher.fetch_many(entries, progress_hook=streaming_hook))
+    finally:
+        output_fh.close()
+
+    # Emit completion event
+    emitter.done(
+        success=failed_count == 0,
+        summary={"total": len(results), "failed": failed_count, "consecutive_errors": consecutive_errors},
     )
 
-    annotate_paywall_metadata(results, policy)
-    hash_cache_path = run_artifacts_dir / "fetch_cache" / "content_hashes.json"
-    _annotate_content_changes(results, hash_cache_path)
+    # Save the updated cache back to disk
+    if content_cache:
+        hash_cache_path.parent.mkdir(parents=True, exist_ok=True)
+        hash_cache_path.write_text(json.dumps(content_cache, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # Final task-monitor update
+    try:
+        if monitor_state_path.exists():
+            state = json.loads(monitor_state_path.read_text(encoding="utf-8"))
+            state["status"] = "completed"
+            state["last_updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            monitor_state_path.write_text(json.dumps(state), encoding="utf-8")
+    except Exception:
+        pass
+
 
     repo_root = resolve_repo_root(inventory_path)
 
@@ -811,6 +966,28 @@ def run_fetch_pipeline(
         run_artifacts_dir,
         policy,
     )
+
+    # Learn from failures if enabled
+    if os.getenv("FETCHER_LEARN_FAILURES", "0") == "1":
+        try:
+            from ..memory_integration import learn_failure_patterns
+            outstanding_path = run_artifacts_dir / "outstanding_urls_summary.json"
+            if outstanding_path.exists():
+                outstanding_data = json.loads(outstanding_path.read_text(encoding="utf-8"))
+                failures = [
+                    {
+                        "url": item.get("url"),
+                        "domain": item.get("domain"),
+                        "category": item.get("category"),
+                        "error": item.get("reason"),
+                    }
+                    for item in outstanding_data.get("items", [])
+                ]
+                learned = learn_failure_patterns(failures, scope="fetcher")
+                if learned > 0:
+                    print(f"[fetcher] Learned {learned} failure patterns to memory", file=sys.stderr)
+        except Exception as e:
+            print(f"[fetcher] Memory learning skipped: {e}", file=sys.stderr)
 
     pdf_paywall_mismatches = _collect_pdf_paywall_mismatches(results)
 
@@ -847,9 +1024,10 @@ def run_fetch_pipeline(
         resolved_max_windows,
     )
 
+    # _write_change_feed needs to run after results are populated
     _write_change_feed(results, run_artifacts_dir)
 
-    write_results(results, output_path)
+    # write_results(results, output_path)  <-- DISABLED: handled incrementally in streaming_hook
     _write_junk_report(results, run_artifacts_dir)
 
     return FetcherResult(

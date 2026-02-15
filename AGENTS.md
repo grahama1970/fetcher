@@ -41,3 +41,49 @@ module, keep the following in mind:
 - Keep changes backwards compatible; several repos consume this via file path dependencies.
 - Use semantic version bumps in `pyproject.toml` whenever you change the public API or default policy.
 - For breaking schema updates, coordinate with Sparta/LiteLLM maintainers and document the migration steps.
+
+## Long-Running Tasks - Watchdog Monitoring (REQUIRED)
+
+**For any task running >5 minutes, agents MUST set up watchdog monitoring.**
+
+### Pattern
+
+1. **Start background monitor** before launching long-running task:
+```bash
+# Create watchdog script
+cat > /tmp/monitor_<task>.sh << 'EOF'
+#!/bin/bash
+while true; do
+    {
+        echo "=== Monitor Report $(date) ==="
+        # Check process status
+        pgrep -f "<process_pattern>" > /dev/null && echo "Status: RUNNING" || echo "Status: STOPPED"
+        # Check metrics (rejections, errors, progress)
+        grep -c "ERROR\|REJECT" "$LOG_FILE" 2>/dev/null
+        # Show recent progress
+        grep "progress\|complete" "$LOG_FILE" | tail -5
+    } > /tmp/<task>_report.txt
+    sleep 60
+done
+EOF
+nohup /tmp/monitor_<task>.sh &
+```
+
+2. **Check report periodically**:
+```bash
+cat /tmp/<task>_report.txt
+```
+
+3. **Set alerts** for anomalies:
+   - Rejection rate >30% = investigate
+   - Process stopped unexpectedly = alert
+   - No progress for >10 min = check for issues
+
+### Why This Matters
+
+- LLM batch calls take 5-15 minutes per batch
+- Without monitoring, you won't know if:
+  - Process crashed
+  - Rejection rate is abnormally high
+  - Progress stalled
+- Early detection saves hours of wasted compute
