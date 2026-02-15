@@ -216,14 +216,42 @@ def maybe_externalize_text(
 
 
 def _guess_blob_extension(url: str, content_type: str) -> str:
+    """Guess file extension from URL and content-type.
+
+    Prioritizes content-type for known types (PDF, images) to handle URLs
+    like arxiv.org/pdf/2406.05925 where the path suffix is an ID, not extension.
+    """
+    # First, try content-type for reliable types
+    ct_ext = mimetypes.guess_extension(content_type or "", strict=False)
+
+    # For PDF, images, and other binary types, trust content-type over URL
+    reliable_content_types = {
+        "application/pdf": ".pdf",
+        "image/png": ".png",
+        "image/jpeg": ".jpg",
+        "image/gif": ".gif",
+        "image/webp": ".webp",
+        "application/zip": ".zip",
+        "application/gzip": ".gz",
+    }
+    if content_type in reliable_content_types:
+        return reliable_content_types[content_type]
+
+    # Try URL path suffix
     try:
         path_suffix = Path(urlparse(url).path or "").suffix
     except Exception:
         path_suffix = ""
+
+    # Validate path suffix looks like a real extension (not numeric ID like .05925)
     if path_suffix and len(path_suffix) <= 10:
-        return path_suffix
-    ext = mimetypes.guess_extension(content_type or "", strict=False)
-    return ext or ".bin"
+        # Skip if it's just a number (e.g., .05925 from arxiv URLs)
+        suffix_without_dot = path_suffix[1:]  # Remove leading dot
+        if not suffix_without_dot.replace(".", "").isdigit():
+            return path_suffix
+
+    # Fall back to content-type extension or .bin
+    return ct_ext or ".bin"
 
 
 def _persist_blob_for_result(result: FetchResult, download_dir: Path) -> Optional[Path]:
@@ -592,7 +620,15 @@ def materialize_markdown(
         metadata = dict(result.metadata or {})
         if (metadata.get("content_verdict") or "").lower() != "ok":
             continue
-        raw = _read_raw_text_for_extraction(result)
+        # Prefer raw_bytes for HTML conversion (result.text now contains extracted text)
+        raw = ""
+        if result.raw_bytes:
+            try:
+                raw = result.raw_bytes.decode("utf-8", "ignore")
+            except Exception:
+                pass
+        if not raw:
+            raw = _read_raw_text_for_extraction(result)
         if not raw.strip():
             continue
         # Only attempt markdown conversion when the payload is likely HTML.

@@ -97,7 +97,7 @@ def test_materialize_markdown_writes_artifact(tmp_path: Path) -> None:
         method="aiohttp",
         metadata={},
         from_cache=False,
-        raw_bytes=None,
+        raw_bytes=html.encode("utf-8"),  # materialize_markdown needs raw HTML
     )
     evaluate_result_content(result)
     materialize_markdown([result], tmp_path, enabled=True, min_chars=1, emit_fit_markdown=True, fit_min_chars=50, overrides_path=None)
@@ -136,7 +136,7 @@ def test_fit_markdown_uses_selector_rules(tmp_path: Path) -> None:
         method="aiohttp",
         metadata={},
         from_cache=False,
-        raw_bytes=None,
+        raw_bytes=html.encode("utf-8"),  # materialize_markdown needs raw HTML
     )
     evaluate_result_content(result)
     materialize_markdown([result], tmp_path, enabled=True, min_chars=1, emit_fit_markdown=True, fit_min_chars=1, overrides_path=overrides)

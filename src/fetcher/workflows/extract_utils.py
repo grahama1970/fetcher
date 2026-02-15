@@ -422,6 +422,7 @@ def evaluate_result_content(result) -> None:
 
     lowered_ct = (result.content_type or "").lower()
     is_pdf = "pdf" in lowered_ct or bool(metadata.get("pdf_text_extracted"))
+    is_youtube = getattr(result, "method", "") == "youtube-skill"
 
     # If we successfully extracted substantial text from a PDF, treat generic
     # paywall/weak-content signals as soft warnings instead of hard failures.
@@ -434,6 +435,16 @@ def evaluate_result_content(result) -> None:
         verdict = "ok"
         reasons = [r for r in reasons if r not in {"too_short", "high_link_density", "weak_content", "paywall_markers"}]
         reasons.append("pdf_long_text_override")
+
+    # YouTube transcripts often fall into 'weak' (short) or 'thin' (very short)
+    # categories but are still valid and usable.
+    if is_youtube and verdict in {"weak", "thin"} and assessment.text_len > 0:
+        metadata["content_verdict_original"] = verdict
+        if reasons:
+            metadata["content_reasons_original"] = reasons
+        verdict = "ok"
+        reasons = [r for r in reasons if r not in {"too_short", "weak_content"}]
+        reasons.append("youtube_transcript_preserve")
 
     warning_text = _detect_deprecation_warning(html)
     metadata.update(
@@ -474,6 +485,9 @@ def evaluate_result_content(result) -> None:
             metadata["paywall_stub"] = True
         else:
             result.text = ""
+    else:
+        # Replace raw HTML with extracted clean text
+        result.text = assessment.text
     result.metadata = metadata
 
 

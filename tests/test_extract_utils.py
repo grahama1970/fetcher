@@ -44,7 +44,9 @@ def test_evaluate_result_accepts_article_content():
     result = _result(html)
     evaluate_result_content(result)
     assert result.metadata["content_verdict"] == "ok"
-    assert result.text == html
+    # result.text should now contain extracted text, not raw HTML
+    assert "This is a sentence" in result.text
+    assert "<html>" not in result.text
 
 
 def test_evaluate_result_allows_link_heavy_domains():
@@ -138,10 +140,12 @@ def test_pdf_password_recovered_allows_content():
     evaluate_result_content(result)
 
     assert result.metadata["content_verdict"] == "ok"
-    assert result.text == body
+    # For non-HTML content types, text is stripped but otherwise preserved
+    assert result.text == body.strip()
 
 
 def test_extract_pdf_text_flags_password_protected_pdf_bytes():
+    """Verify password-protected PDFs raise RuntimeError when password cannot be recovered."""
     if fitz is None:
         pytest.skip("PyMuPDF not installed")
 
@@ -158,11 +162,13 @@ def test_extract_pdf_text_flags_password_protected_pdf_bytes():
     doc.close()
 
     fetcher = URLFetcher(FetchConfig())
-    text, meta = fetcher._extract_pdf_text(pdf_bytes, "https://example.com/protected.pdf")
+    # Password-protected PDFs that can't be cracked now raise RuntimeError
+    # (changed from silent failure to loud failure for observability)
+    with pytest.raises(RuntimeError) as exc_info:
+        fetcher._extract_pdf_text(pdf_bytes, "https://example.com/protected.pdf")
 
-    assert text == ""
-    assert meta.get("pdf_password_protected") is True
-    assert meta.get("pdf_text_extracted") is False
+    assert "PDF password not recovered" in str(exc_info.value)
+    assert "protected.pdf" in str(exc_info.value)
 
 
 def test_extract_pdf_text_cracks_simple_password(monkeypatch):

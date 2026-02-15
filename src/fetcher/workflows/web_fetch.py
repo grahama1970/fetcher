@@ -54,6 +54,9 @@ except Exception:  # pragma: no cover - handled at runtime
 
 SPA_FALLBACK_DOMAINS = {
     "antigravity.google",
+    "attack.mitre.org",  # React SPA - 124 URLs affected in SPARTA pipeline
+    "csf.tools",  # NIST CSF control mappings - JS-heavy
+    "cwe.mitre.org",  # CWE weakness definitions - JS-heavy
     "d3fend.mitre.org",
     "atlas.mitre.org",
     "www.reuters.com",
